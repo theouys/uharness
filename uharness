@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Launch the U-HARNESS AI agent.
+#
+# The agent always runs in the *caller's* current directory, so it works on
+# whatever workspace you are standing in, while the script itself is loaded
+# from wherever this repo happens to live.
+set -euo pipefail
+
+# Resolve this script's own directory, following symlinks, so the launcher
+# works when installed on PATH as a symlink as well as when run by path.
+source="${BASH_SOURCE[0]}"
+while [ -L "$source" ]; do
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  source="$(readlink "$source")"
+  [[ "$source" != /* ]] && source="$dir/$source"
+done
+here="$(cd -P "$(dirname "$source")" && pwd)"
+
+# Prefer python3; fall back to a bare `python` only if python3 is missing.
+if command -v python3 >/dev/null 2>&1; then
+  py=python3
+elif command -v python >/dev/null 2>&1; then
+  py=python
+else
+  echo "uharness: python3 not found on PATH (need Python 3.10 or newer)" >&2
+  exit 127
+fi
+
+exec "$py" "$here/uharness.py" "$@"
