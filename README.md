@@ -13,6 +13,13 @@ and no server — you run it, it does the task, it exits.
 
 Written by: Theo Uys
 
+### Repository
+
+Source code: [github.com/theouys/uharness](https://github.com/theouys/uharness)
+
+Bug reports, questions and pull requests are welcome — open an issue on the
+tracker and describe what you ran, what you expected and what happened instead.
+
 ---
 
 ## Free by default, paid on demand
