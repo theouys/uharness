@@ -24,9 +24,12 @@ In the interactive session, /save [name] stores the conversation in
 /model shows the model in use; /model free and /model paid switch between
 the free Token Harbor model and the paid DeepSeek model.
 
-Skills are reusable instruction packs kept in the skills/ directory. Type
-@{skill-name} anywhere in a prompt and that skill's text is dropped into the
-context just before the request; /skills lists what is available.
+Skills are reusable instruction packs. Type @{skill-name} anywhere in a prompt
+and that skill's text is dropped into the context just before the request;
+/skills lists what is available. Two folders are searched, the workspace's
+skills/ directory first and then the skills/ folder beside this script, so the
+bundled packs work from any project directory. HARNESS_SKILLS_DIR replaces both
+with your own directory (or a colon-separated list).
 
 The prompt reads its own keystrokes, so backspace, the arrow keys and Ctrl-U
 work in any terminal (and editing keys never leak into the text). Setting
@@ -153,7 +156,11 @@ SESSION_PREVIEW_CHARS = 60               # first user line shown in /sessions
 
 # Skills: reusable instruction packs the user loads with @{skill-name}.
 # Each skill is skills/<name>/SKILL.md, or a single skills/<name>.md file.
-SKILLS_DIR_NAME = os.environ.get("HARNESS_SKILLS_DIR", "skills")
+# Two folders are searched by default: <workspace>/skills and the skills/
+# folder next to this script, so the same packs work from any directory.
+HARNESS_SKILLS_DIR_ENV = "HARNESS_SKILLS_DIR"
+SKILLS_DIR_NAME = "skills"     # the folder name used in both default locations
+SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_FILENAMES = ("SKILL.md", "skill.md")
 MAX_SKILL_CHARS = 40_000       # characters read from one skill file
 MAX_SKILL_NAME = 80            # characters kept from a referenced skill name
@@ -209,9 +216,12 @@ SKILL_SYSTEM_PROMPT = """\
 
 Skills
 ------
-This workspace can hold reusable instruction packs ("skills") in its skills/
-directory. The user loads one by typing @{skill-name}; its text then arrives
-as a [skills] message immediately before the request that mentioned it.
+This agent can load reusable instruction packs ("skills") from up to two
+folders: the workspace's own skills/ directory and the skills/ folder beside
+uharness.py that ships with the harness. The user loads one by typing
+@{skill-name}; its text then arrives as a [skills] message immediately before
+the request that mentioned it. The index below lists the skills from both
+folders, so a skill the user mentions may come from either one.
 
 - A loaded skill is part of the current request: follow it, and keep following
   it for the rest of the conversation.
@@ -1440,6 +1450,10 @@ def session_preview(messages: list[dict[str, Any]], limit: int = SESSION_PREVIEW
 #     skills/<name>/SKILL.md     a folder, free to carry extra reference files
 #     skills/<name>.md           a single file
 #
+# "skills/" here means either of the two folders searched by default: the
+# workspace's own skills/ and the skills/ folder next to this script (see
+# SkillBook). Both are searched every time, the workspace first.
+#
 # An optional "---" frontmatter header supplies name and description; without
 # one the file (or folder) name and the first line do the job. Nothing is read
 # from a skill until the user references it, so a large skills/ folder costs
@@ -1501,13 +1515,69 @@ def first_line(text: str, limit: int = 120) -> str:
 
 
 class SkillBook:
-    """Discovers the skills under <workspace>/skills and loads them on demand."""
+    """Discovers the skills under one or more directories, on demand.
+
+    By default two folders are searched: the workspace's own ``skills/`` and
+    the ``skills/`` folder next to ``uharness.py``. The workspace comes first,
+    so a project skill wins over a bundled one with the same name, and the
+    same packs are available whichever directory the harness is started from.
+
+    A skill directory does not have to live inside the workspace. An absolute
+    path (or ``~``) is accepted, which is how a skills folder kept in a dotfile
+    directory stays usable from every project. Several roots can be given as a
+    ``os.pathsep``-separated string; earlier roots win when two skills share a
+    name. Passing `directory` explicitly (or setting ``HARNESS_SKILLS_DIR``)
+    replaces the default pair completely.
+    """
 
     def __init__(self, workspace: Path, directory: str | None = None) -> None:
         self.workspace = workspace
-        self.directory = directory or SKILLS_DIR_NAME
-        candidate = Path(self.directory).expanduser()
-        self.root = (candidate if candidate.is_absolute() else workspace / candidate).resolve()
+        if directory is not None:
+            self.directory = str(directory)
+            bundled = False
+        else:
+            from_env = os.environ.get(HARNESS_SKILLS_DIR_ENV, "").strip()
+            self.directory = from_env or SKILLS_DIR_NAME
+            bundled = not from_env
+        names = [
+            part.strip() for part in self.directory.split(os.pathsep) if part.strip()
+        ] or [SKILLS_DIR_NAME]
+        candidates: list[Path] = []
+        for name in names:
+            candidate = Path(name).expanduser()
+            candidates.append(
+                candidate if candidate.is_absolute() else workspace / candidate
+            )
+        if bundled:
+            # No configuration at all: also look beside uharness.py, which is
+            # where a checkout keeps the skills it ships with.
+            candidates.append(SCRIPT_DIR / "skills")
+        self.roots: list[Path] = []
+        for candidate in candidates:
+            root = candidate.resolve()
+            if root not in self.roots:
+                self.roots.append(root)
+
+    @property
+    def root(self) -> Path:
+        """The first (highest-priority) root, for messages that need one."""
+        return self.roots[0]
+
+    def inside_workspace(self, path: Path) -> bool:
+        """True when `path` sits inside the workspace the agent may edit."""
+        try:
+            path.relative_to(self.workspace)
+        except ValueError:
+            return False
+        return True
+
+    def external_roots(self) -> list[Path]:
+        """Skill roots that live outside the workspace, so reads need granting."""
+        return [root for root in self.roots if not self.inside_workspace(root)]
+
+    def describe_roots(self) -> str:
+        """Human-readable list of the places skills are looked up."""
+        return " or ".join(f"{self.rel(root)}/" for root in self.roots)
 
     def rel(self, path: Path) -> str:
         try:
@@ -1517,32 +1587,33 @@ class SkillBook:
 
     def discover(self) -> list[Skill]:
         """Every readable skill, sorted by name. Cheap enough to call often."""
-        if not self.root.is_dir():
-            return []
         found: dict[str, Skill] = {}
-        try:
-            entries = sorted(self.root.iterdir(), key=lambda item: item.name.lower())
-        except OSError:
-            return []
-        for entry in entries:
-            if entry.name.startswith("."):
+        for root in self.roots:
+            if not root.is_dir():
                 continue
-            if entry.is_dir():
-                path = next(
-                    (entry / name for name in SKILL_FILENAMES if (entry / name).is_file()),
-                    None,
-                )
-                origin = entry.name
-            elif entry.suffix.lower() == ".md":
-                path = entry
-                origin = entry.stem
-            else:
+            try:
+                entries = sorted(root.iterdir(), key=lambda item: item.name.lower())
+            except OSError:
                 continue
-            if path is None:
-                continue
-            skill = self._read(path, origin)
-            if skill is not None:
-                found.setdefault(skill.name.lower(), skill)
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    path = next(
+                        (entry / name for name in SKILL_FILENAMES if (entry / name).is_file()),
+                        None,
+                    )
+                    origin = entry.name
+                elif entry.suffix.lower() == ".md":
+                    path = entry
+                    origin = entry.stem
+                else:
+                    continue
+                if path is None:
+                    continue
+                skill = self._read(path, origin)
+                if skill is not None:
+                    found.setdefault(skill.name.lower(), skill)
         return sorted(found.values(), key=lambda skill: skill.name.lower())
 
     def _read(self, path: Path, origin: str) -> Skill | None:
@@ -1574,7 +1645,7 @@ class SkillBook:
     def bundled(self, skill: Skill) -> list[Path]:
         """Sibling files of a folder skill, so the model knows it may read them."""
         parent = skill.path.parent
-        if parent == self.root:
+        if parent in self.roots:
             return []
         try:
             return [
@@ -1624,6 +1695,15 @@ def skill_context(loaded: list[Skill], missing: list[str], book: SkillBook) -> s
         extras = book.bundled(skill)
         if extras:
             header += "\nbundled files: " + ", ".join(book.rel(path) for path in extras)
+        if not book.inside_workspace(skill.path):
+            # The skill sits outside the workspace, so the paths above are
+            # absolute. Say what the model may do with them, and what it may not.
+            header += (
+                "\nlocation: this skill lives outside the workspace. Its files are "
+                "readable with read_file, but they are not part of the workspace: do "
+                "not edit or delete them, and copy anything you need into the "
+                "workspace first."
+            )
         parts.append(header)
         parts.append(skill.body or "(this skill file is empty)")
     if missing:
@@ -1631,7 +1711,7 @@ def skill_context(loaded: list[Skill], missing: list[str], book: SkillBook) -> s
         parts.append(
             f"\n{SKILL_BLOCK_PREFIX} warning: no skill named "
             + ", ".join(f"@{{{name}}}" for name in missing)
-            + f" exists in {book.rel(book.root)}/. Available skills: {available}. "
+            + f" exists in {book.describe_roots()}. Available skills: {available}. "
             "Carry on with the request without it."
         )
     return "\n".join(parts)
@@ -1683,6 +1763,8 @@ class Harness:
         thinking: bool = False,
         log_path: Path | None = None,
         show_usage: bool = False,
+        skills_dir: str | None = None,
+        autosave: bool = True,
     ) -> None:
         self.workspace = workspace.resolve()
         self.model = model
@@ -1697,7 +1779,17 @@ class Harness:
         # Console verbosity: "full", "brief" (no result bodies) or "quiet".
         self.verbosity = VERBOSITY
         self.sessions_dir = self.workspace / SESSION_DIR_NAME
-        self.skills = SkillBook(self.workspace)
+        # Autosave writes to last_session_name when this run already saved or
+        # opened a conversation, so a resumed chat updates that one file
+        # instead of piling up copies. It fires after every turn *and* on the
+        # way out, so a crash or a killed terminal costs at most one turn
+        # (--no-autosave turns the whole thing off).
+        self.autosave = autosave
+        self.last_session_name: str | None = None
+        self._autosave_warned = False   # one warning per run, not one per turn
+        # A skills directory may live outside the workspace; read_roots() turns
+        # any such directory into a read-only grant (see resolve()).
+        self.skills = SkillBook(self.workspace, skills_dir)
         self.loaded_skills: dict[str, str] = {}   # name -> body already in context
         self.usage: dict[str, int] = {}
         self.api_calls = 0
@@ -1834,7 +1926,7 @@ class Harness:
         for name in missing:
             print(
                 notice("warn", f"no skill named @{{{name}}} in "
-                               f"{self.skills.rel(self.skills.root)}/ - /skills lists them",
+                               f"{self.skills.describe_roots()} - /skills lists them",
                        stream=sys.stderr),
                 file=sys.stderr,
             )
@@ -1842,21 +1934,63 @@ class Harness:
 
     # -- path handling ----------------------------------------------------- #
 
-    def resolve(self, filename: str) -> Path:
+    @staticmethod
+    def _inside(path: Path, root: Path) -> bool:
+        """True when `path` is `root` itself or lives underneath it."""
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
+
+    def read_roots(self) -> list[Path]:
+        """Directories the read-only tools may look at, workspace first.
+
+        The workspace is always readable and writable. A skills directory that
+        lives outside it - say ~/.config/uharness/skills - is readable too, so
+        `read_file` can fetch a skill's bundled reference files. Skills are
+        data the user installed on purpose, so this grant is narrow: it covers
+        the skill directories only, never their parents, and it never allows a
+        write.
+        """
+        roots = [self.workspace]
+        for root in self.skills.external_roots():
+            if root not in roots:
+                roots.append(root)
+        return roots
+
+    def resolve(self, filename: str, *, write: bool = False) -> Path:
+        """Turn a tool-supplied path into a safe absolute one.
+
+        Reads are allowed inside the workspace and inside any external skill
+        directory. Writes (`write=True`) are allowed inside the workspace only,
+        so a skill installed elsewhere can be read but never modified.
+        """
         if not filename or not filename.strip():
             raise ToolError("filename must not be empty")
         candidate = Path(filename).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
         resolved = candidate.resolve()
-        try:
-            resolved.relative_to(self.workspace)
-        except ValueError:
+
+        if self._inside(resolved, self.workspace):
+            return resolved
+        if not write:
+            for root in self.read_roots()[1:]:
+                if self._inside(resolved, root):
+                    return resolved
             raise ToolError(
-                f"path '{filename}' is outside the workspace ({self.workspace}); "
-                "use a path inside it"
-            ) from None
-        return resolved
+                f"path '{filename}' is outside the workspace ({self.workspace}) and "
+                "outside every skill directory; use a path inside the workspace"
+            )
+        raise ToolError(
+            f"path '{filename}' is outside the workspace ({self.workspace}); "
+            "changes must be written inside it"
+        )
+
+    def resolve_write(self, filename: str) -> Path:
+        """A path that may be modified: the workspace, nothing else."""
+        return self.resolve(filename, write=True)
 
     def rel(self, path: Path) -> str:
         try:
@@ -2129,7 +2263,7 @@ class Harness:
         new_string: str,
         replace_all: bool = False,
     ) -> str:
-        path = self.resolve(filename)
+        path = self.resolve_write(filename)
         if not path.exists():
             raise ToolError(f"file not found: {filename}")
         if path.is_dir():
@@ -2190,7 +2324,7 @@ class Harness:
         )
 
     def tool_write_file(self, filename: str, content: str) -> str:
-        path = self.resolve(filename)
+        path = self.resolve_write(filename)
         exists = path.exists()
         if exists and path.is_dir():
             raise ToolError(f"'{filename}' is a directory")
@@ -2209,7 +2343,7 @@ class Harness:
         return f"{verb} {self.rel(path)} ({len(content.encode('utf-8'))} bytes, {lines} lines)"
 
     def tool_append_file(self, filename: str, content: str) -> str:
-        path = self.resolve(filename)
+        path = self.resolve_write(filename)
         if self.dry_run:
             return f"DRY RUN: would append {len(content)} characters to {self.rel(path)}"
         if not self._approve("Append to file", self.rel(path)):
@@ -2223,7 +2357,7 @@ class Harness:
         return f"Appended {len(content.encode('utf-8'))} bytes to {self.rel(path)}"
 
     def tool_delete_file(self, filename: str, recursive: bool = False) -> str:
-        path = self.resolve(filename)
+        path = self.resolve_write(filename)
         if path == self.workspace:
             raise ToolError("refusing to delete the workspace root")
         if not path.exists():
@@ -2578,6 +2712,19 @@ class Harness:
         )
 
     def run(self, user_message: str) -> str:
+        """Answer one user message, autosaving at every step on the way.
+
+        The final save sits in a finally block, so an API error, a Ctrl+C or
+        hitting --max-turns still leaves the conversation on disk exactly as
+        far as it got - a long run is never lost just because it did not end
+        tidily.
+        """
+        try:
+            return self._run_turn(user_message)
+        finally:
+            self.autosave_tick()
+
+    def _run_turn(self, user_message: str) -> str:
         # Pull any @{skill} the prompt references into the conversation first,
         # so the skill text sits *before* the request that asked for it. This
         # also refreshes the system prompt, so a skill added to disk since
@@ -2588,6 +2735,9 @@ class Harness:
         user_entry = {"role": "user", "content": user_message}
         self.messages.append(user_entry)
         self._log(user_entry)
+        # Checkpoint the request before the first API call: if the process is
+        # killed while the model is thinking, the prompt itself still survives.
+        self.autosave_tick()
 
         for _turn in range(1, self.max_turns + 1):
             self._compress_history()
@@ -2685,6 +2835,11 @@ class Harness:
                 self._report_usage()
                 return "interrupted"
 
+            # Turn finished: push the conversation to disk before asking the
+            # model for the next step, so a crash mid-task resumes from the
+            # last tool result instead of from the start.
+            self.autosave_tick()
+
         summary = self._summarise_after_limit()
         self._report_usage()
         return summary
@@ -2737,6 +2892,7 @@ class Harness:
             except OSError:
                 pass
             raise
+        self.last_session_name = path.stem   # autosave keeps updating this file
         return path
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -2808,8 +2964,43 @@ class Harness:
         ]
         self.messages = [self.messages[0], *restored]
         self._compaction_noted = False
+        self.last_session_name = chosen["name"]   # autosave writes back here
         chosen["restored"] = len(restored)
         return chosen
+
+    def autosave_session(self) -> Path | None:
+        """Save the conversation on the way out; None if there is nothing to keep.
+
+        A conversation that never got past the system prompt is not written, so
+        opening the harness and quitting straight away leaves no clutter. When
+        the run already used /save or /open, that same file is updated, so
+        resuming a chat and quitting again does not spawn a copy every time.
+        """
+        if len(self.messages) <= 1:
+            return None
+        return self.save_session(self.last_session_name)
+
+    def autosave_tick(self) -> None:
+        """Write the conversation mid-run so nothing is lost if the run dies.
+
+        run() calls this after every turn, and once more when the request ends
+        however it ends. It stays quiet: the single "autosaved ..." line comes
+        from the exit path, and a full disk should not print a warning per
+        turn, so the first failure is reported and the rest are swallowed.
+        """
+        if not self.autosave:
+            return
+        try:
+            self.autosave_session()
+        except (OSError, ValueError) as exc:
+            if self._autosave_warned:
+                return
+            self._autosave_warned = True
+            print(
+                notice("warn", f"could not autosave: {exc} (continuing)",
+                       stream=sys.stderr),
+                file=sys.stderr,
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -3427,6 +3618,65 @@ def run_selftest() -> int:
 
         check("load_session reports missing conversations", _session_errors)
 
+        def _autosave_skips_empty() -> None:
+            idle = make_harness()
+            shutil.rmtree(idle.sessions_dir, ignore_errors=True)
+            assert idle.autosave_session() is None, "an empty chat should not be saved"
+            assert not idle.sessions_dir.exists(), "sessions dir was created needlessly"
+            idle.autosave = False
+            idle.messages.append({"role": "user", "content": "hi"})
+            assert _capture(lambda: autosave_on_exit(idle)) == "", "quiet exit printed"
+            assert not list(idle.sessions_dir.glob("*.json")), "--no-autosave still saved"
+
+        check("autosave skips an empty conversation and honours autosave=False",
+              _autosave_skips_empty)
+
+        def _autosave_names() -> None:
+            with tempfile.TemporaryDirectory() as room:
+                home = Path(room)
+                talker = Harness(home, api_key="selftest-key", auto_approve=True)
+                talker.messages.append({"role": "user", "content": "plan the trip"})
+                talker.messages.append({"role": "assistant", "content": "sure"})
+                fresh = talker.autosave_session()
+                assert fresh is not None and fresh.exists(), fresh
+                assert fresh.stem.startswith("chat-"), fresh.stem
+                printed = _capture(lambda: autosave_on_exit(talker))
+                assert "/open" in printed, printed
+                # Autosaving again with no /save or /open in between keeps
+                # writing the same file: one chat is one file, however many
+                # turns it takes.
+                again = talker.autosave_session()
+                assert again == fresh, (again, fresh)
+                assert len(list(talker.sessions_dir.glob("*.json"))) == 1, (
+                    "autosave piled up copies of one chat"
+                )
+
+                saved = talker.save_session("roadtrip")
+                assert talker.autosave_session() == saved, (
+                    "autosave ignored the saved name"
+                )
+                payload = json.loads(saved.read_text(encoding="utf-8"))
+                assert [m["content"] for m in payload["messages"][1:]] == [
+                    "plan the trip", "sure",
+                ], payload
+                # /save forked a named copy; the autosave file is still there.
+                assert fresh.exists(), "the earlier autosave file vanished"
+                assert len(list(talker.sessions_dir.glob("*.json"))) == 2, (
+                    "expected the chat file plus roadtrip.json"
+                )
+
+                resumed = Harness(home, api_key="selftest-key", auto_approve=True)
+                resumed.load_session("roadtrip")
+                assert resumed.autosave_session() == saved, (
+                    "autosave did not update the opened file"
+                )
+                assert len(list(resumed.sessions_dir.glob("*.json"))) == 2, (
+                    "autosave made a copy"
+                )
+
+        check("autosave writes a new chat file, or updates the one in use",
+              _autosave_names)
+
         # -- agent loop (fake client, no network) ---------------------------
         def fake_call(call_id: str, name: str, arguments: dict[str, Any]) -> Any:
             return types.SimpleNamespace(
@@ -3528,13 +3778,92 @@ def run_selftest() -> int:
 
         check("run() asks for a summary when --max-turns is hit", _loop_turn_limit)
 
+        def _run_autosaves_as_it_goes() -> None:
+            # A run must not depend on the process living long enough to quit
+            # tidily: each turn is on disk before the next API call goes out.
+            with tempfile.TemporaryDirectory() as room:
+                saver = Harness(Path(room), api_key="selftest-key",
+                                auto_approve=True)
+                on_disk: list[list[str]] = []
+                script = [
+                    fake_response(tool_calls=[
+                        fake_call("c1", "write_file",
+                                  {"filename": "note.txt", "content": "kept\n"}),
+                    ]),
+                    fake_response(content="wrote note.txt"),
+                ]
+
+                def create(**kwargs: Any) -> Any:
+                    # Snapshot the sessions folder as each request goes out.
+                    on_disk.append(
+                        sorted(p.stem for p in saver.sessions_dir.glob("*.json"))
+                    )
+                    return script.pop(0)
+
+                saver.client = types.SimpleNamespace(
+                    chat=types.SimpleNamespace(
+                        completions=types.SimpleNamespace(create=create)
+                    )
+                )
+                assert saver.run("write note.txt") == "wrote note.txt"
+                assert len(on_disk) == 2, on_disk
+                assert all(names for names in on_disk), (
+                    f"nothing saved before an API call: {on_disk}"
+                )
+                # The prompt survives the first request, the tool result the
+                # second - and both land in one file, not a copy per turn.
+                assert on_disk[0] == on_disk[1], f"a new file per turn: {on_disk}"
+                (saved,) = saver.sessions_dir.glob("*.json")
+                payload = json.loads(saved.read_text(encoding="utf-8"))
+                blobs = [str(m.get("content") or "") for m in payload["messages"]]
+                assert any("write note.txt" in blob for blob in blobs), payload
+                assert any("note.txt" in blob for blob in blobs), payload
+
+            # A crash in the middle of a turn still leaves the file behind.
+            with tempfile.TemporaryDirectory() as room:
+                boom = Harness(Path(room), api_key="selftest-key",
+                               auto_approve=True)
+                boom.client = fake_client(
+                    [fake_response(tool_calls=[fake_call("c1", "list_files", {})])],
+                    [],
+                )
+
+                def explode(*args: Any, **kwargs: Any) -> str:
+                    raise RuntimeError("tool layer exploded")
+
+                boom.dispatch = explode   # type: ignore[method-assign]
+                try:
+                    boom.run("book a flight")
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("the crash never reached the caller")
+                crashed = list(boom.sessions_dir.glob("*.json"))
+                assert crashed, "a crashed run saved nothing"
+                payload = json.loads(crashed[0].read_text(encoding="utf-8"))
+                blobs = [str(m.get("content") or "") for m in payload["messages"]]
+                assert "book a flight" in blobs, payload
+
+            # ...and --no-autosave really does keep every file unwritten.
+            with tempfile.TemporaryDirectory() as room:
+                quiet = Harness(Path(room), api_key="selftest-key",
+                                auto_approve=True, autosave=False)
+                quiet.client = fake_client([fake_response(content="hello")], [])
+                assert quiet.run("say hello") == "hello"
+                assert not list(quiet.sessions_dir.glob("*.json")), (
+                    "autosave=False still wrote a conversation"
+                )
+
+        check("run() autosaves every turn, keeps one file, and survives a crash",
+              _run_autosaves_as_it_goes)
+
         # -- skills ----------------------------------------------------------
         #
         # A skill only matters if the text actually reaches the model, so
         # these checks drive run() with a fake client and inspect the request.
 
         def _seed_skill() -> None:
-            root = workspace / SKILLS_DIR_NAME
+            root = workspace / "skills"
             (root / "polite").mkdir(parents=True, exist_ok=True)
             (root / "polite" / "SKILL.md").write_text(
                 "---\n"
@@ -3549,7 +3878,9 @@ def run_selftest() -> int:
             _seed_skill()
             book = make_harness().skills
             listed = book.discover()
-            assert [skill.name for skill in listed] == ["polite"], listed
+            # The workspace skill is there. A checkout may also ship skills
+            # beside uharness.py, so compare by name, not by the whole list.
+            assert "polite" in [skill.name for skill in listed], listed
             index = book.index()
             assert "@{polite}" in index and "say please" in index, index
             # find() is case-insensitive over the name and the folder name...
@@ -3559,6 +3890,59 @@ def run_selftest() -> int:
             assert book.find("say please") is None, "find() matched a description"
 
         check("skills are discovered, indexed and found by name", _skill_index)
+
+        def _seed_checkout() -> Path:
+            """A pretend checkout: a skills/ folder beside a fake uharness.py."""
+            checkout = workspace / "checkout"
+            for name, body in (
+                ("hushed", "Whisper. HUSH_MARKER\n"),
+                ("polite", "Bundled copy. BUNDLED_MARKER\n"),
+            ):
+                (checkout / "skills" / name).mkdir(parents=True, exist_ok=True)
+                (checkout / "skills" / name / "SKILL.md").write_text(
+                    f"---\nname: {name}\n---\n{body}", encoding="utf-8"
+                )
+            return checkout
+
+        def _skills_next_to_the_script() -> None:
+            # Whatever the working directory, the skills/ folder beside
+            # uharness.py is searched too - and the workspace wins a name clash.
+            global SCRIPT_DIR
+            checkout = _seed_checkout()
+            _seed_skill()
+            saved, SCRIPT_DIR = SCRIPT_DIR, checkout
+            try:
+                book = SkillBook(workspace, None)
+            finally:
+                SCRIPT_DIR = saved
+            assert book.roots[0] == (workspace / "skills").resolve(), book.roots
+            assert book.roots[1] == (checkout / "skills").resolve(), book.roots
+            names = [skill.name for skill in book.discover()]
+            assert "hushed" in names, names
+            # A project skill shadows a bundled one of the same name.
+            polite = book.find("polite")
+            assert polite is not None and "POLITE_MARKER" in polite.body, polite
+
+        check("skills beside uharness.py are found, workspace first",
+              _skills_next_to_the_script)
+
+        def _skills_next_to_the_script_reach_the_model() -> None:
+            # The system prompt index and @{name} loading both cover the
+            # script-side folder, not just the workspace one.
+            global SCRIPT_DIR
+            checkout = _seed_checkout()
+            saved, SCRIPT_DIR = SCRIPT_DIR, checkout
+            try:
+                stood_up = make_harness()
+            finally:
+                SCRIPT_DIR = saved
+            assert "@{hushed}" in stood_up.system_prompt(), stood_up.system_prompt()
+            loaded = stood_up.load_skills("@{hushed} please")
+            assert [skill.name for skill in loaded] == ["hushed"], loaded
+            assert "HUSH_MARKER" in stood_up.messages[-1]["content"]
+
+        check("a skill beside uharness.py reaches the model",
+              _skills_next_to_the_script_reach_the_model)
 
         def _skill_references() -> None:
             assert referenced_skills("hi @{polite} and @{polite}") == ["polite"]
@@ -3616,8 +4000,13 @@ def run_selftest() -> int:
         check("an unknown @{skill} is reported, not fatal", _skill_missing_is_warned)
 
         def _skills_absent_without_the_directory() -> None:
-            bare = make_harness()
-            shutil.rmtree(bare.skills.root, ignore_errors=True)
+            # A workspace with no skills folder is not an error. The root is
+            # pinned here, because the defaults also look beside uharness.py.
+            empty = workspace / "no-skills"
+            empty.mkdir(exist_ok=True)
+            bare = Harness(
+                empty, api_key="selftest-key", auto_approve=True, skills_dir="skills"
+            )
             assert bare.skills.discover() == []
             assert bare.skills.index() == ""
             # No skill index is appended, so the prompt is the base rules only.
@@ -3662,6 +4051,10 @@ def build_parser() -> argparse.ArgumentParser:
             "                     (or answer 'always' at an allow? prompt)\n"
             "  /context       show how much context the conversation is using\n"
             "  /reset, /help, /exit\n"
+            "\n"
+            "The conversation is autosaved after every turn and again on exit,\n"
+            "so even a crash leaves /open something to resume from\n"
+            "(--no-autosave turns that off).\n"
         ),
     )
     parser.add_argument("prompt", nargs="*", help="what you want the agent to do")
@@ -3718,6 +4111,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-autosave", action="store_true",
+        help=(
+            "do not autosave the conversation - by default every turn is "
+            "written to "
+            f"{SESSION_DIR_NAME}/ as it happens, and once more when the "
+            "interactive session ends (by default /exit, Ctrl+D and Ctrl+C all "
+            "write it, so /open can resume it)"
+        ),
+    )
+    parser.add_argument(
         "--no-banner", action="store_true",
         help="start quietly, without the U-HARNESS text-art logo",
     )
@@ -3752,8 +4155,11 @@ def show_skills(harness: Harness) -> None:
     """Print the skill names and nothing else - a one-line answer on purpose."""
     skills = harness.skills.discover()
     if not skills:
-        root = harness.skills.rel(harness.skills.root)
-        print(notice("info", f"no skills yet - add {root}/<name>/SKILL.md", force=True))
+        # Name every folder that was searched, so the user knows where a skill
+        # would be picked up from.
+        roots = harness.skills.describe_roots()
+        print(notice("info", f"no skills yet - add <name>/SKILL.md in {roots}",
+                     force=True))
         return
     print(paint("skills: ", "bold", "cyan") + ", ".join(skill.name for skill in skills))
 
@@ -3846,6 +4252,30 @@ def choose_session(harness: Harness) -> str | None:
     return answer or None
 
 
+def autosave_on_exit(harness: Harness) -> None:
+    """Write the conversation on the way out so /open can pick it up again.
+
+    Called from every way out of the interactive loop (Ctrl+C, Ctrl+D, /exit,
+    "exit"), so a session is never lost just because quitting was the last
+    thing typed. A failed save warns and lets the exit continue - losing a
+    conversation is bad, but refusing to quit would be worse.
+    """
+    if not harness.autosave:
+        return
+    try:
+        path = harness.autosave_session()
+    except (OSError, ValueError) as exc:
+        print(notice("warn", f"could not autosave: {exc}", stream=sys.stderr),
+              file=sys.stderr)
+        return
+    if path is None:
+        return
+    print(notice(
+        "info",
+        f"autosaved {harness.rel(path)} - /open {path.stem} carries on from here",
+    ))
+
+
 def interactive_loop(harness: Harness) -> None:
     print()
     print(notice(
@@ -3869,6 +4299,7 @@ def interactive_loop(harness: Harness) -> None:
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            autosave_on_exit(harness)
             return
         if not line:
             continue
@@ -3880,6 +4311,7 @@ def interactive_loop(harness: Harness) -> None:
             argument = argument.strip()
 
             if word in {"/exit", "/quit"}:
+                autosave_on_exit(harness)
                 return
             if word in {"/help", "/?"}:
                 show_commands()
@@ -3977,6 +4409,7 @@ def interactive_loop(harness: Harness) -> None:
             continue
 
         if line in {"exit", "quit"}:
+            autosave_on_exit(harness)
             return
         try:
             harness.run(line)
@@ -4025,6 +4458,7 @@ def main() -> int:
         thinking=args.thinking,
         log_path=Path(args.log).expanduser() if args.log else None,
         show_usage=args.usage,
+        autosave=not args.no_autosave,
     )
 
     rows: list[tuple[str, str]] = [
@@ -4038,6 +4472,8 @@ def main() -> int:
     else:
         approval = "auto (--yes)" if args.yes else "ask before write/edit/delete/execute"
         rows.append(("approval", approval))
+    if harness.autosave:
+        rows.append(("autosave", f"after every turn to {SESSION_DIR_NAME}/"))
 
     if args.no_banner:
         for label, value in rows:

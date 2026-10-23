@@ -190,6 +190,23 @@ ln -s "$PWD/uharness" ~/.local/bin/uharness
 The launcher follows symlinks, so this works. If `~/.local/bin` is not on your
 `PATH`, either add it or use `/usr/local/bin` with `sudo`.
 
+The launcher is a pure pass-through: every argument you give it — options, the
+prompt, quoted words containing spaces, `--`, even things that look like flags —
+reaches `uharness.py` untouched, in the same order, and the agent's exit status
+is the launcher's exit status. So the command-line reference below applies
+verbatim to `uharness`:
+
+```bash
+uharness -y --verbosity full "clean up utils.py and run the tests"
+```
+
+The only knob the launcher itself reads is `UHARNESS_PYTHON`, naming the
+interpreter to use (default: `python3`, falling back to `python`):
+
+```bash
+UHARNESS_PYTHON=~/.venvs/agent/bin/python uharness --selftest
+```
+
 You can also skip the launcher and call the script directly, passing an explicit
 workspace:
 
@@ -300,6 +317,7 @@ one argument. If you give no prompt, you drop straight into interactive mode.
 | `--thinking` | off | Ask the provider to enable the model's reasoning mode. |
 | `--usage` | off | Print a token-usage line after each request. |
 | `--verbosity LEVEL` | `brief` | `quiet`, `brief` or `full` — see below. |
+| `--no-autosave` | off | Do not write the conversation to `.harness_sessions/`: no per-turn saves and no save on exit. |
 | `--no-banner` | off | Skip the startup logo. |
 | `--log PATH` | off | Append the conversation to a file as JSON lines. |
 
@@ -399,10 +417,10 @@ request, Ctrl+D (or `/exit`) leaves.
 
 | Command | What it does |
 |---------|--------------|
-| `/save [name]` | Save the conversation to `.harness_sessions/`. Without a name, uses a timestamp. |
+| `/save [name]` | Save the conversation to `.harness_sessions/` under your own name. Without a name, uses a timestamp. Handy before a risky experiment. |
 | `/open [name]` | List saved conversations and continue one. Accepts a number or a name. |
 | `/sessions` | List saved conversations without opening one. |
-| `/skills` | List the skill names available in this workspace. |
+| `/skills` | List the skill names available to this agent (workspace and bundled). |
 | `/approve [on\|off]` | Stop or start asking before write/edit/delete/execute. Blank toggles. |
 | `/model [free\|paid]` | Show the model in use, or switch tier. Blank shows it. |
 | `/context` | Show how much context the conversation is using. |
@@ -412,6 +430,36 @@ request, Ctrl+D (or `/exit`) leaves.
 | `/exit` | Leave. |
 
 Typing `exit` or `quit` (no slash) also leaves.
+
+### Autosave, and picking up where you left off
+
+You do not have to remember to save. Every conversation is written to
+`.harness_sessions/` **as it happens**:
+
+- the moment you send a prompt, before the model is even asked;
+- after every turn, once the tool results are in;
+- and once more on the way out, whether that is `/exit`, Ctrl+D or Ctrl+C.
+
+So a crashed process, a closed terminal or a `kill` costs you at most the turn
+in flight — not the session. One conversation is one file: the turn-by-turn
+writes keep updating the same `chat-<timestamp>.json`, so autosaving a
+100-turn session leaves one file behind, not a hundred.
+
+`/save` still has a job: it forks the chat under a name you choose
+(`/save refactor-attempt`), which is what you want before trying something you
+may want to roll back. `/open` then restores any of them, and continues writing
+back to that same file:
+
+```
+you> /sessions
+  saved conversations
+   1. refactor-attempt   14 messages   2026-10-23T21:14:02
+   2. chat-20261023-210833   62 messages   2026-10-23T21:10:41
+you> /open refactor-attempt
+```
+
+Autosave is on by default. `--no-autosave` turns off all of it — the per-turn
+writes and the save on exit — for when you want a run that leaves no trace.
 
 ### Switching models on the fly
 
@@ -460,7 +508,7 @@ one in a minute.
 
 ### Layout
 
-Two forms are supported:
+Two forms are supported, and both can be mixed in the same folder:
 
 ```
 skills/
@@ -468,6 +516,45 @@ skills/
 │   └── SKILL.md          # a folder, free to carry extra reference files
 └── concise.md            # or a single file
 ```
+
+### Where skills are looked up
+
+Without any configuration, **two** folders are searched, in this order:
+
+| # | Folder | Why |
+|---|--------|-----|
+| 1 | `<workspace>/skills/` | Skills that belong to the project you are working in. |
+| 2 | the `skills/` folder next to `uharness.py` | The packs the checkout ships with. |
+
+Both are always searched, so you can keep a personal library in the repo and
+project-specific skills in the project, and use either no matter which
+directory you start the agent from:
+
+```bash
+cd ~/work/my-app
+uharness "..."          # sees ~/work/my-app/skills and <repo>/skills
+```
+
+When two skills share a name, **the first folder wins**, so a project skill
+shadows a bundled one of the same name. `/skills` lists the merged result.
+
+To take over completely, set `HARNESS_SKILLS_DIR`. It **replaces** the two
+default folders rather than adding to them, and accepts several paths
+separated by `:` (`;` on Windows):
+
+```bash
+export HARNESS_SKILLS_DIR="$HOME/.config/uharness/skills:./skills"
+```
+
+A skills folder outside the workspace — a dotfile directory, say — is
+supported: its skills can be read like any other, but the agent is not allowed
+to edit or delete them, so a shared library cannot be damaged by a stray
+`write_file`. A skill loaded from outside the workspace says so in the
+conversation, and bundled reference files can be read with `read_file` and
+copied into the workspace if they are needed there.
+
+If a folder does not exist it is simply skipped; a workspace with no skills at
+all is normal and the agent behaves exactly as before.
 
 ### Writing one
 
@@ -514,8 +601,9 @@ Notes:
   read them with `read_file` if it needs them.
 
 Skills are discovered when the agent starts and re-checked on every request, so
-you can add one and use it without restarting. Point at a different directory
-with `HARNESS_SKILLS_DIR`.
+you can drop a new folder into either location and use it without restarting.
+Run `/skills` to see what was found, or set `HARNESS_SKILLS_DIR` to point
+somewhere else entirely.
 
 ---
 
@@ -531,7 +619,7 @@ with `HARNESS_SKILLS_DIR`.
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Paid-tier endpoint. |
 | `HARNESS_VERBOSITY` | `brief` | Default verbosity. |
 | `HARNESS_MAX_HISTORY_CHARS` | `400000` | Compaction threshold. `0` disables it. |
-| `HARNESS_SKILLS_DIR` | `skills` | Where skills are looked up. |
+| `HARNESS_SKILLS_DIR` | *(unset)* | Where skills are looked up. Unset: `<workspace>/skills` **and** the `skills/` folder next to `uharness.py`. Set: replaces both, `:`-separated (`;` on Windows) for several folders. |
 | `HARNESS_INPUT` | *(auto)* | Set to `builtin` to use Python's plain `input()` instead of the arrow-key editor. |
 | `NO_COLOR` | *(unset)* | Set to anything to disable ANSI colour. |
 | `CLICOLOR_FORCE` | *(unset)* | Non-zero forces colour even when piped. |
@@ -662,11 +750,12 @@ The tool layer can be verified without an API key or any network access:
 It exercises path confinement, the file tools, ambiguous and CRLF-safe edits,
 search, the delete guards, dry-run, command execution and timeouts, tree
 killing, the approval logic, output bounding, the line editor's wrapping, history
-compaction, saved sessions, skill loading and the agent loop (against a fake
-client). Expected output:
+compaction, saved sessions, skill loading (from the workspace and from the
+folder beside `uharness.py`) and the agent loop (against a fake client).
+Expected output:
 
 ```
-selftest: 49/49 checks passed
+selftest: 51/51 checks passed
 All tool-layer checks passed (no network used).
 ```
 
@@ -679,18 +768,25 @@ a non-interactive denial.
 
 ```
 uharness                  Launcher script. Runs the agent in your cwd.
-uharness.py               The entire agent. Single file, ~4,000 lines.
-skills/                   Skill packs.
-└── always-be-funny/
-    └── SKILL.md          Example skill.
-.harness_sessions/        Saved conversations (created on first /save).
+uharness.py               The entire agent. Single file, ~4,200 lines.
+skills/                   Skill packs, searched from every workspace.
+├── always-be-funny/
+│   └── SKILL.md          Example skill.
+└── test/
+    └── SKILL.md          Example skill: inventory a folder into report.md.
+.harness_sessions/        Autosaved conversations, written as you chat.
 .gitignore
 README.md
 ```
 
-`.harness_sessions/` is git-ignored. It holds your saved conversations in plain
-JSON — they may contain code and paths you would rather not publish, so treat it
-as private.
+The `skills/` folder here is the *bundled* one: it is searched in addition to
+`<workspace>/skills`, whatever directory you launch from. See
+[Where skills are looked up](#where-skills-are-looked-up).
+
+`.harness_sessions/` is git-ignored. It holds your autosaved conversations in
+plain JSON — they may contain code and paths you would rather not publish, so
+treat it as private. Delete the folder whenever you like; the harness recreates
+it on the next prompt.
 
 ---
 

@@ -16,8 +16,12 @@ while [ -L "$source" ]; do
 done
 here="$(cd -P "$(dirname "$source")" && pwd)"
 
-# Prefer python3; fall back to a bare `python` only if python3 is missing.
-if command -v python3 >/dev/null 2>&1; then
+# Pick the interpreter. UHARNESS_PYTHON wins so you can point the launcher at a
+# specific build; otherwise prefer python3 and fall back to a bare `python`
+# only if python3 is missing.
+if [ -n "${UHARNESS_PYTHON:-}" ]; then
+  py="$UHARNESS_PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
   py=python3
 elif command -v python >/dev/null 2>&1; then
   py=python
@@ -26,4 +30,15 @@ else
   exit 127
 fi
 
+# Fail with something readable instead of a traceback when the launcher is
+# copied somewhere without the agent next to it.
+if [ ! -f "$here/uharness.py" ]; then
+  echo "uharness: cannot find uharness.py in $here" >&2
+  exit 127
+fi
+
+# Pass through every argument untouched: options, the prompt, quoted words with
+# spaces, `--`, and anything else the shell handed us. argv is forwarded
+# verbatim - no filtering, reordering, quoting or interpretation happens here -
+# and `exec` keeps stdin/stdout/stderr and the exit status the agent's own.
 exec "$py" "$here/uharness.py" "$@"
