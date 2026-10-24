@@ -1,6 +1,7 @@
 # U-HARNESS
 
-A small, readable AI coding agent that runs in your terminal.
+A small, readable AI coding agent that runs in your terminal — or in a small
+tkinter window, if you prefer.
 
 U-HARNESS hands a language model a set of file and shell tools and lets it work
 on the directory you are standing in. It reads and searches files, writes and
@@ -64,9 +65,11 @@ See [Getting an API key](#getting-an-api-key) for the details, or
 - [Installation](#installation)
 - [Getting an API key](#getting-an-api-key)
 - [Quick start](#quick-start)
+- [Getting help](#getting-help)
 - [Command-line reference](#command-line-reference)
 - [Approval and safety](#approval-and-safety)
 - [Interactive mode](#interactive-mode)
+- [Desktop window](#desktop-window)
 - [Skills](#skills)
 - [Environment variables](#environment-variables)
 - [How it works](#how-it-works)
@@ -161,8 +164,9 @@ The agent adjusts to its environment in three places:
 - **Process killing.** Timeouts kill the whole process tree — via process
   groups on POSIX and `taskkill /T` on Windows.
 
-Everything is pure Python standard library apart from `openai`. There is no
-compiled code to build.
+Everything is pure Python standard library apart from `openai`, plus `tkinter`
+for the optional [desktop window](#desktop-window) — and that is stdlib too,
+just not always installed. There is no compiled code to build.
 
 ---
 
@@ -213,6 +217,10 @@ workspace:
 ```bash
 python3 /path/to/uharness.py --workspace ~/myproject "..."
 ```
+
+If you would rather have a window than a prompt, `uharness-ui.py` beside it is
+the same agent with a tkinter front-end — see [Desktop window](#desktop-window).
+It needs `python3-tk`, which the terminal version does not.
 
 ---
 
@@ -290,6 +298,43 @@ you> /exit
 
 ---
 
+## Getting help
+
+Two doors, both offline and both instant:
+
+| Where | What you get |
+|-------|--------------|
+| `uharness --help` | Every command-line option, the interactive command list with the aliases, the skills lookup rules, which environment variable holds each tier's key, and worked examples. |
+| `/help` inside a session | Just the command panel — each command on one line with its argument hint and aliases — so it stays readable while a conversation is open. |
+
+Neither contacts the network or needs an API key, so `uharness --help` works on
+a fresh checkout before you have configured anything. A typo in a slash command
+prints a warning naming the bad word and points back at `/help`; it is never
+sent to the model.
+
+The [desktop window](#desktop-window) takes the same flags, so
+`python3 uharness-ui.py --help` prints the same reference with the window's key
+bindings added.
+
+```
+╭─ commands ──────────────────────────────────────────────────────────────╮
+│ /save [name]        save this conversation (blank: timestamp name)      │
+│ /open [name]        list saved conversations and continue one           │
+│ /sessions           list saved conversations (alias /ls)                │
+│ /skills             list skill names (alias /skill)                     │
+│ /approve [on|off]   ask before write/edit/delete/execute (alias /auto)  │
+│ /model [free|paid]  show the model in use, or switch tier               │
+│ /context            how much context the conversation uses (alias /ctx) │
+│ /verbose [level]    quiet, brief or full (alias /verbosity)             │
+│ /reset              forget the current conversation                     │
+│ /help               this list (alias /?)                                │
+│ /exit               leave (alias /quit; 'exit' and Ctrl+D too)          │
+╰─────────────────────────────────────────────────────────────────────────╯
+  unknown commands are warned about, never sent to the model
+```
+
+---
+
 ## Command-line reference
 
 ```
@@ -306,14 +351,14 @@ one argument. If you give no prompt, you drop straight into interactive mode.
 | `-h`, `--help` | | Show the built-in help and exit. |
 | prompt | *(interactive)* | The task to run. Omitted entirely, starts interactive mode. |
 | `-i`, `--interactive` | off | Run the prompt (if any), then stay open for more. |
-| `-y`, `--yes` | off | Auto-approve writes, edits, deletes and command execution. |
-| `--allow-dangerous` | off | Also permit commands matching the dangerous blocklist. |
+| `-y`, `--yes` | off | Auto-approve writes, edits, deletes and command execution. Does **not** lift the dangerous-command blocklist. |
+| `--allow-dangerous` | off | Also permit commands matching the dangerous blocklist. Needs approval as well. |
 | `--dry-run` | off | Report what would change; change nothing. |
 | `--selftest` | | Run the offline tool-layer checks and exit. Needs no API key. |
 | `-w`, `--workspace PATH` | current dir | The only directory the agent may touch. |
-| `-m`, `--model NAME` | `deepseek-v4.1-flash:free` | Model to use. |
-| `--max-turns N` | `20` | Model/tool round trips per request before wrapping up. |
-| `--command-timeout S` | `120` | Default timeout for shell commands (max 600). |
+| `-m`, `--model NAME` | `deepseek-v4.1-flash:free` | Model to use. Overrides the tier defaults from the environment. |
+| `--max-turns N` | `20` | Model/tool round trips per request before the model is asked to wrap up. |
+| `--command-timeout S` | `120` | Default timeout for shell commands (max 600). The model may ask for a different one per call. |
 | `--thinking` | off | Ask the provider to enable the model's reasoning mode. |
 | `--usage` | off | Print a token-usage line after each request. |
 | `--verbosity LEVEL` | `brief` | `quiet`, `brief` or `full` — see below. |
@@ -321,20 +366,30 @@ one argument. If you give no prompt, you drop straight into interactive mode.
 | `--no-banner` | off | Skip the startup logo. |
 | `--log PATH` | off | Append the conversation to a file as JSON lines. |
 
+The same reference is available offline — `uharness --help` prints every option,
+the interactive command list, the skills lookup rules and which key each tier
+needs, without contacting the network.
+
 ### Verbosity
 
 This controls **only what you see**. The model and `--log` always receive the
 complete, untruncated result.
 
-- `quiet` — the tool headline only. Command output is collapsed to a one-line
-  summary. Warnings, errors and denials are still shown; the plumbing lines
-  (context, usage, skill loading) are not.
-- `brief` *(default)* — the same, plus the outcome of each call, e.g.
-  `↳ Created app.py (412 bytes, 18 lines)`. A failing command still shows why.
-- `full` — every result body, every line of command output.
+In both `quiet` and `brief` each tool call prints its headline and a one-line
+outcome — `⚙ write_file`, then `↳ Created app.py (412 bytes, 18 lines)` — and
+nothing else: no result bodies, no lines of command output. That is why they
+feel almost identical. The one difference is the plumbing.
+
+- `quiet` — headlines and outcomes only. Every `warn`, `error` and `denied`
+  line still prints, but the chatter is gone: no context or token-usage lines,
+  no "loading skill" notices, no session badge on the way out.
+- `brief` *(default)* — the same one-line display, plus those plumbing lines:
+  context size, token usage, skill loading, retries and the exit badge.
+- `full` — every result body and every line of command output.
 
 Change it at runtime with `/verbose`, or set `HARNESS_VERBOSITY` in the
-environment. `--verbosity` on the command line wins.
+environment. `--verbosity` on the command line wins. `/verbose` with no
+argument prints the level in force.
 
 ### Examples
 
@@ -419,17 +474,23 @@ request, Ctrl+D (or `/exit`) leaves.
 |---------|--------------|
 | `/save [name]` | Save the conversation to `.harness_sessions/` under your own name. Without a name, uses a timestamp. Handy before a risky experiment. |
 | `/open [name]` | List saved conversations and continue one. Accepts a number or a name. |
-| `/sessions` | List saved conversations without opening one. |
-| `/skills` | List the skill names available to this agent (workspace and bundled). |
-| `/approve [on\|off]` | Stop or start asking before write/edit/delete/execute. Blank toggles. |
+| `/sessions` | List saved conversations without opening one. Alias: `/ls`. |
+| `/skills` | List the skill names available to this agent (workspace and bundled). Alias: `/skill`. |
+| `/approve [on\|off]` | Stop or start asking before write/edit/delete/execute. Blank toggles. Alias: `/auto`. |
 | `/model [free\|paid]` | Show the model in use, or switch tier. Blank shows it. |
-| `/context` | Show how much context the conversation is using. |
-| `/verbose [full\|brief\|quiet]` | How much of each tool result is printed. |
+| `/context` | Show how much context the conversation is using. Alias: `/ctx`. |
+| `/verbose [full\|brief\|quiet]` | How much of each tool result is printed. Blank prints the level in force. Alias: `/verbosity`. |
 | `/reset` | Forget the current conversation, keep the session alive. |
-| `/help` | Show the command list. |
-| `/exit` | Leave. |
+| `/help` | Show the command panel, aliases included. Alias: `/?`. |
+| `/exit` | Leave. Aliases: `/quit`; typing `exit` or `quit` (no slash) also works. |
 
-Typing `exit` or `quit` (no slash) also leaves.
+`/help` prints the same command panel as the tail of `uharness --help`, which
+also documents every command-line option, the skills lookup rules and the API
+keys. The greeting you see when a session opens lists the command names and
+points at `/help` for the detail.
+
+An unknown slash command is not sent to the model — it prints a warning naming
+the offending word and points at `/help`, so a typo never costs you a request.
 
 ### Autosave, and picking up where you left off
 
@@ -497,6 +558,57 @@ tool output the model has already used. Ask for `/context` to see the breakdown:
 
 Character counts are exact. Token counts are an estimate — the harness does not
 tokenise locally — so treat them as a rough guide.
+
+---
+
+## Desktop window
+
+`uharness-ui.py` is the same agent in a tkinter window: the prompt box at the
+top, everything the agent prints below it.
+
+```bash
+python3 uharness-ui.py                          # empty window
+python3 uharness-ui.py "Summarise README.md"    # ask straight away
+python3 uharness-ui.py --workspace ~/project --yes
+```
+
+It accepts every option `uharness.py` accepts — `--yes`, `--dry-run`,
+`--thinking`, `--usage`, `--verbosity`, `-m`, `--max-turns`,
+`--command-timeout`, `--log`, `--selftest` and the rest — and every slash
+command works when typed into the prompt box, exactly as in the terminal. An
+unknown slash command still only prints a warning and never reaches the model.
+
+The menu bar mirrors those commands, so nothing has to be memorised:
+
+| Menu | What is in it |
+|------|---------------|
+| **File** | Save conversation (Ctrl+S), open one (Ctrl+O), list them, export the feedback pane, quit (Ctrl+Q) |
+| **Agent** | Auto-approve, dry run, thinking mode, token usage, verbosity, free/paid model, show the model in use |
+| **Conversation** | Forget the conversation, show context size, change workspace |
+| **Skills** | List the skills available to this agent, refresh the skill index |
+| **Tools** | Run the offline self-test |
+| **View** | Clear the feedback pane (Ctrl+L) |
+| **Help** | The command list, about this window |
+
+Keys: `Enter` sends, `Shift+Enter` adds a line, `Ctrl+Up`/`Ctrl+Down` walk back
+and forth through what you have typed, `Ctrl+S` saves, `Ctrl+O` opens, `Ctrl+L`
+clears the pane, `Ctrl+Q` quits. While a request runs the **Stop** button
+interrupts it, the same way Ctrl+C does in the terminal.
+
+It is a skin, not a fork: it imports `uharness.py` and drives the same `Harness`
+object, so the tools, skills, saved sessions, autosave, context compaction and
+the dangerous-command blocklist are all the terminal version's. The one piece
+replaced is the terminal `allow?` line, which becomes a modal dialog with
+**Allow once**, **Deny** and **Always allow** (`Enter` allows, `Esc` denies).
+**Always allow** throws the same switch as `/approve off` in the terminal — the
+*Agent → Auto-approve tools* checkbox, which the window keeps in step with the
+harness as you type commands. Autosave is the same store, so a conversation
+begun in the window can be resumed with `/open` in the terminal, and the other
+way round.
+
+Needs tkinter and a display. macOS and the python.org Windows builds include it;
+on Debian or Ubuntu install it with `sudo apt install python3-tk`. The terminal
+version does not need tkinter, and `--selftest` and `--help` work in both regardless.
 
 ---
 
@@ -737,6 +849,15 @@ input that never comes will also time out.
 The task needed more steps than `--max-turns`. Raise it, or split the task into
 smaller requests.
 
+**`ModuleNotFoundError: No module named 'tkinter'` from `uharness-ui.py`.**
+The window needs tkinter; the terminal agent does not. On Debian or Ubuntu,
+`sudo apt install python3-tk`; on Fedora, `sudo dnf install python3-tkinter`.
+`python3 uharness.py --selftest` keeps working meanwhile.
+
+**`couldn't connect to display ":0"` from `uharness-ui.py`.**
+There is no graphical session to draw in — over SSH, either forward X
+(`ssh -X`) or use the terminal version, which needs no display.
+
 ---
 
 ## Self-test
@@ -755,12 +876,14 @@ folder beside `uharness.py`) and the agent loop (against a fake client).
 Expected output:
 
 ```
-selftest: 51/51 checks passed
+selftest: 54/54 checks passed
 All tool-layer checks passed (no network used).
 ```
 
-A couple of checks are skipped when stdin is a TTY, because they need to observe
-a non-interactive denial.
+The exact count moves as checks are added or removed, so treat it as a shape
+rather than a number: what matters is that no `FAIL` line appears and the exit
+status is 0. A couple of checks are skipped when stdin is a TTY, because they
+need to observe a non-interactive denial.
 
 ---
 
@@ -768,7 +891,8 @@ a non-interactive denial.
 
 ```
 uharness                  Launcher script. Runs the agent in your cwd.
-uharness.py               The entire agent. Single file, ~4,200 lines.
+uharness.py               The entire agent. Single file, ~4,500 lines.
+uharness-ui.py            Optional tkinter window around the same agent.
 skills/                   Skill packs, searched from every workspace.
 ├── always-be-funny/
 │   └── SKILL.md          Example skill.

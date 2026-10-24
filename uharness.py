@@ -4032,25 +4032,48 @@ def run_selftest() -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Agent harness: let DeepSeek read, edit and run files for you.",
+        description=(
+            "Agent harness: let an LLM read, edit and run files for you.\n"
+            "Free by default on DeepSeek's deepseek-v4.1-flash:free via Token\n"
+            "Harbor; /model paid switches to DeepSeek's own endpoint."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             '  python3 uharness.py "Create hello.py that prints hello"\n'
             '  python3 uharness.py --yes "Read data.csv and write report.md"\n'
             '  python3 uharness.py --dry-run "Rename things in utils.py"\n'
+            '  python3 uharness.py --verbosity full "Explain how auth works"\n'
+            '  python3 uharness.py "@{test} inventory the docs/ folder"\n'
             '  python3 uharness.py --selftest     # verify tools offline\n'
             "  python3 uharness.py                # interactive\n"
             "\n"
-            "Interactive commands:\n"
-            "  /save [name]   save the conversation to .harness_sessions/\n"
-            "  /open [name]   pick a saved conversation and continue it\n"
-            "  /sessions      list saved conversations\n"
-            "  /skills        list skill names\n"
-            "  /approve [on|off]  toggle asking before write/edit/delete/execute\n"
-            "                     (or answer 'always' at an allow? prompt)\n"
-            "  /context       show how much context the conversation is using\n"
-            "  /reset, /help, /exit\n"
+            "Interactive commands (blank arguments are shown as [name];\n"
+            "/help inside a session prints the same list):\n"
+            "  /save [name]        save the conversation to .harness_sessions/\n"
+            "  /open [name]        pick a saved conversation and continue it\n"
+            "  /sessions           list saved conversations\n"
+            "  /skills             list skill names\n"
+            "  /approve [on|off]   toggle asking before write/edit/delete/execute\n"
+            "                      (or answer 'always' at an allow? prompt)\n"
+            "  /model [free|paid]  show the model in use, or switch tier\n"
+            "  /context            show how much context the conversation uses\n"
+            "  /verbose [level]    quiet, brief or full - how much result text prints\n"
+            "  /reset              forget the current conversation\n"
+            "  /help               this list\n"
+            "  /exit               leave (Ctrl+D and 'exit' work too)\n"
+            "Aliases: /? for /help, /ls for /sessions, /skill for /skills,\n"
+            "/auto for /approve, /ctx for /context, /verbosity for /verbose,\n"
+            "/quit for /exit. A bare 'exit' or 'quit' leaves too. An unknown\n"
+            "slash command only prints a warning - it never reaches the model.\n"
+            "\n"
+            "Skills: type @{name} anywhere in a prompt to load\n"
+            "skills/<name>/SKILL.md (or skills/<name>.md) from <workspace>/skills\n"
+            "and from the skills/ folder beside this script; /skills lists them,\n"
+            "and HARNESS_SKILLS_DIR replaces both folders.\n"
+            "\n"
+            "API keys: TOKENHARBOR_API_KEY for the free tier (the default) or\n"
+            "DEEPSEEK_API_KEY for the paid tier; /model switches at runtime.\n"
             "\n"
             "The conversation is autosaved after every turn and again on exit,\n"
             "so even a crash leaves /open something to resume from\n"
@@ -4061,7 +4084,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-i", "--interactive", action="store_true", help="keep asking for prompts")
     parser.add_argument(
         "-y", "--yes", action="store_true",
-        help="auto-approve file writes, edits, deletes and command execution",
+        help=(
+            "auto-approve file writes, edits, deletes and command execution "
+            "(does not lift the dangerous-command blocklist - that needs "
+            "--allow-dangerous)"
+        ),
     )
     parser.add_argument(
         "--allow-dangerous", action="store_true",
@@ -4081,15 +4108,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-m", "--model", default=DEFAULT_MODEL,
-        help=f"DeepSeek model name (default: {DEFAULT_MODEL})",
+        help=(
+            f"model to use (default: {DEFAULT_MODEL}, the free Token Harbor "
+            f"tier; /model paid switches to {PAID_MODEL} at "
+            f"{PAID_BASE_URL})"
+        ),
     )
     parser.add_argument(
         "--max-turns", type=int, default=20,
-        help="maximum model/tool round trips per request (default: 20)",
+        help=(
+            "maximum model/tool round trips per request (default: 20); the "
+            "model is asked to summarise when it is reached"
+        ),
     )
     parser.add_argument(
         "--command-timeout", type=int, default=120,
-        help="default shell command timeout in seconds (default: 120)",
+        help=(
+            "default shell command timeout in seconds (default: 120, max "
+            f"{MAX_COMMAND_TIMEOUT}); the model can still ask for a different "
+            "one per call"
+        ),
     )
     parser.add_argument(
         "--thinking", action="store_true",
@@ -4114,10 +4152,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-autosave", action="store_true",
         help=(
             "do not autosave the conversation - by default every turn is "
-            "written to "
-            f"{SESSION_DIR_NAME}/ as it happens, and once more when the "
-            "interactive session ends (by default /exit, Ctrl+D and Ctrl+C all "
-            "write it, so /open can resume it)"
+            f"written to {SESSION_DIR_NAME}/ as it happens, and once more when "
+            "the session ends (/exit, Ctrl+D and Ctrl+C all save), so /open "
+            "can resume it; this flag removes both writes"
         ),
     )
     parser.add_argument(
@@ -4132,23 +4169,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 COMMANDS: list[tuple[str, str]] = [
-    ("/save [name]", "save this conversation (name optional)"),
+    ("/save [name]", "save this conversation (blank: timestamp name)"),
     ("/open [name]", "list saved conversations and continue one"),
-    ("/sessions", "list saved conversations without opening one"),
-    ("/skills", "list skill names"),
-    ("/approve [on|off]", "stop or start asking before write/edit/delete/execute"),
+    ("/sessions", "list saved conversations (alias /ls)"),
+    ("/skills", "list skill names (alias /skill)"),
+    ("/approve [on|off]", "ask before write/edit/delete/execute (alias /auto)"),
     ("/model [free|paid]", "show the model in use, or switch tier"),
-    ("/context", "show how much context the conversation is using"),
-    ("/verbose [full|brief|quiet]", "how much of each tool result is printed"),
+    ("/context", "how much context the conversation uses (alias /ctx)"),
+    ("/verbose [level]", "quiet, brief or full (alias /verbosity)"),
     ("/reset", "forget the current conversation"),
-    ("/help", "show this list"),
-    ("/exit", "leave the harness"),
+    ("/help", "this list (alias /?)"),
+    ("/exit", "leave (alias /quit; 'exit' and Ctrl+D too)"),
 ]
 
 
 def show_commands() -> None:
     print()
     print(panel("commands", COMMANDS))
+    print(paint("  unknown commands are warned about, never sent to the model",
+                "dim"))
 
 
 def show_skills(harness: Harness) -> None:
@@ -4277,16 +4316,15 @@ def autosave_on_exit(harness: Harness) -> None:
 
 
 def interactive_loop(harness: Harness) -> None:
+    # Built from COMMANDS so the greeting cannot drift out of step with /help.
+    listing = ", ".join(name.split(" ")[0] for name, _ in COMMANDS)
     print()
+    print(notice("info", f"Commands: {listing}"))
     print(notice(
         "info",
-        "Commands: /save, /open, /sessions, /skills, /context, /approve, "
-        "/reset, /help, /exit",
-    ))
-    print(notice(
-        "info",
-        "At an allow? prompt: y or n, or 'always' to stop asking for the rest "
-        "of the session (Ctrl+C stops a running loop)",
+        "/help explains them and gives the aliases. At an allow? prompt: "
+        "y or n, or 'always' to stop asking for the rest of the session "
+        "(Ctrl+C stops a running loop)",
     ))
     entered: list[str] = []          # up-arrow recalls what you typed
     while True:
