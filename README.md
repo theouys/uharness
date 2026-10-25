@@ -77,6 +77,7 @@ See [Getting an API key](#getting-an-api-key) for the details, or
 - [Troubleshooting](#troubleshooting)
 - [Self-test](#self-test)
 - [Project layout](#project-layout)
+- [License](#license)
 
 ---
 
@@ -975,6 +976,7 @@ skills/                   Skill packs, searched from every workspace.
     └── SKILL.md          Example skill: inventory a folder into report.md.
 .harness_sessions/        Autosaved conversations, written as you chat.
 .gitignore
+LICENSE                   Apache License 2.0 - the terms this project ships under.
 README.md
 ```
 
@@ -991,5 +993,31 @@ it on the next prompt.
 
 ## License
 
-Add your chosen licence here before publishing. If you want a permissive
-starting point, MIT or Apache-2.0 are the usual picks for a tool like this.
+Copyright 2026 Theo Uys
+
+Licensed under the **Apache License, Version 2.0** (the "License");
+you may not use this project except in compliance with the License.
+You may obtain a copy of the License at
+
+<https://www.apache.org/licenses/LICENSE-2.0>
+
+The full licence text is in the [LICENSE](LICENSE) file that ships with this
+repository.
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Apache-2.0 is permissive: you may use, modify and redistribute this code,
+including commercially and in closed-source projects, provided you keep the
+copyright and licence notices and state any changes you made. It also grants
+an explicit patent licence from contributors, which MIT does not.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you shall be licensed as above,
+without any additional terms or conditions — the usual Apache-2.0 inbound
+rule (section 5).
