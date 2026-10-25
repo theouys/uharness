@@ -41,6 +41,18 @@ tracker and describe what you ran, what you expected and what happened instead.
 
 ---
 
+## Screenshots
+
+**Terminal (TUI)** — `python3 uharness.py` in your terminal:
+
+![U-HARNESS running in the terminal](TUI.png)
+
+**Desktop window (GUI)** — the same agent in a tkinter window, `python3 uharness-ui.py`:
+
+![U-HARNESS desktop window](GUI.png)
+
+---
+
 ## Developer or tester: two modes
 
 One file, two jobs. The flag decides which, and it changes three things: the
