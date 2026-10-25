@@ -585,7 +585,13 @@ _STYLES = {
     "magenta": "35", "cyan": "36", "grey": "90",
     "bright_red": "91", "bright_green": "92", "bright_yellow": "93",
     "bright_blue": "94", "bright_magenta": "95", "bright_cyan": "96",
+    # The final answer is drawn in this one: bright blue reads as light blue
+    # on every terminal that supports the bright range, and it is the only
+    # colour the transcript uses for model prose, so the answer stands out.
+    "light_blue": "94",
 }
+
+ANSWER_COLOUR = "light_blue"   # the model's final answer, not mid-turn prose
 
 _UNICODE_GLYPHS = {
     "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│",
@@ -659,6 +665,21 @@ def paint(text: str, *styles: str, stream: Any = None) -> str:
         return text
     prefix = "".join(f"\x1b[{_STYLES[s]}m" for s in styles if s in _STYLES)
     return f"{prefix}{text}{_RESET}"
+
+
+def begin_answer(stream: Any = None) -> None:
+    """Mark the block that follows as the final answer, where the sink cares.
+
+    A terminal needs nothing: `assistant_block(final=True)` already colours
+    that block. The desktop window cannot see colour (its pane strips ANSI),
+    so it hands the harness a stream with an `answer_start()` method and tags
+    the lines that follow instead. Streams without the method - a real
+    console, a test capture, a file - are left alone.
+    """
+    stream = sys.stdout if stream is None else stream
+    hook = getattr(stream, "answer_start", None)
+    if callable(hook):
+        hook()
 
 
 def term_width(*, minimum: int = 44, maximum: int = 100) -> int:
@@ -855,7 +876,7 @@ def _fold_line(line: str, limit: int) -> list[str]:
     return pieces or [""]
 
 
-def assistant_block(text: str, stream: Any = None) -> str:
+def assistant_block(text: str, stream: Any = None, *, final: bool = False) -> str:
     """The model's prose in a coloured left-bordered block.
 
     Long lines are folded here instead of being left to the terminal. The
@@ -863,12 +884,17 @@ def assistant_block(text: str, stream: Any = None) -> str:
     so every wrapped row but the first lost its left edge; folding beforehand
     means each row of the block carries the bar and the whole block keeps its
     outline at any width.
+
+    `final=True` marks the block that answers the request rather than the
+    running commentary around a tool call: heading and prose are drawn in
+    ANSWER_COLOUR so the answer is the one thing that looks different.
     """
     g = glyphs(stream)
     bar = paint(g["v"], "grey", stream=stream)
+    colour = ANSWER_COLOUR if final else "green"
     head = (
-        paint(f"  {g['dot']} ", "green", stream=stream)
-        + paint("assistant", "bold", "green", stream=stream)
+        paint(f"  {g['dot']} ", colour, stream=stream)
+        + paint("assistant", "bold", colour, stream=stream)
     )
     lines = text.strip().splitlines() or [""]
     # One column for the bar, one for the space after it, plus the indent.
@@ -881,9 +907,17 @@ def assistant_block(text: str, stream: Any = None) -> str:
         # rewritten: the line still reads as the model wrote it.
         for piece in _fold_line(line.expandtabs(8), limit):
             piece = piece.rstrip()
-            body.append(
-                f"{RESULT_INDENT}{bar} {piece}" if piece else f"{RESULT_INDENT}{bar}"
-            )
+            if not piece:
+                body.append(f"{RESULT_INDENT}{bar}")
+            elif final:
+                # Only the words change colour: the rail stays grey so the
+                # block keeps its outline.
+                body.append(
+                    f"{RESULT_INDENT}{bar} "
+                    + paint(piece, colour, stream=stream)
+                )
+            else:
+                body.append(f"{RESULT_INDENT}{bar} {piece}")
     return "\n".join([head, *body])
 
 
@@ -2789,7 +2823,8 @@ class Harness:
             )
         if text.strip():
             self.messages.append({"role": "assistant", "content": text})
-            print("\n" + assistant_block(text.strip()))
+            begin_answer()
+            print("\n" + assistant_block(text.strip(), final=True))
             return text
         return (
             f"Stopped after {self.max_turns} turns without a final answer. "
@@ -2868,7 +2903,13 @@ class Harness:
             self._log(assistant_entry)
 
             if content.strip():
-                print("\n" + assistant_block(content.strip()))
+                # Prose that comes with a tool call is commentary; the block
+                # with no calls after it is the answer to the request, and it
+                # is the only one drawn in ANSWER_COLOUR.
+                final = not tool_calls
+                if final:
+                    begin_answer()
+                print("\n" + assistant_block(content.strip(), final=final))
 
             if not tool_calls:
                 self._report_usage()
@@ -3694,6 +3735,43 @@ def run_selftest() -> int:
         check("assistant_block folds long lines and keeps the left rail",
               _assistant_block_wraps)
 
+        # -- the final answer has its own colour ----------------------------
+        def _answer_colour() -> None:
+            """Only the answering block is painted in ANSWER_COLOUR.
+
+            Mid-turn prose and the heading stay green; the block that ends the
+            turn - the answer - is light blue, and the left rail keeps its
+            grey so the block still has an outline.
+            """
+            keep = {name: os.environ.get(name) for name in
+                    ("CLICOLOR_FORCE", "NO_COLOR", "TERM")}
+            os.environ.pop("NO_COLOR", None)
+            os.environ["CLICOLOR_FORCE"] = "1"
+            os.environ["TERM"] = "xterm"
+            try:
+                answer = assistant_block("all done", final=True)
+                prose = assistant_block("looking at the file", final=False)
+            finally:
+                for name, value in keep.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+            light = f"\x1b[{_STYLES[ANSWER_COLOUR]}m"
+            green = f"\x1b[{_STYLES['green']}m"
+            assert light in answer, repr(answer)
+            assert green not in answer, repr(answer)
+            assert green in prose, repr(prose)
+            assert light not in prose, repr(prose)
+            # Colour is decoration: the words are exactly what was asked for.
+            bare = strip_ansi(answer).splitlines()
+            assert bare[0].strip().endswith("assistant"), bare[0]
+            assert bare[1] == f"{RESULT_INDENT}{glyphs()['v']} all done", bare[1]
+
+        check("the final answer is drawn in ANSWER_COLOUR",
+              _answer_colour)
+
         # -- line input ------------------------------------------------------
         def _editing_keys() -> None:
             # Backspace (both codes) must delete, not append a character.
@@ -4082,6 +4160,44 @@ def run_selftest() -> int:
             assert loop.api_calls == 2, loop.api_calls
 
         check("run() dispatches tool calls and returns the final answer", _loop_executes_tools)
+
+        def _answer_marker_only_for_the_answer() -> None:
+            """begin_answer() fires once per turn, for the answering block.
+
+            The desktop pane cannot read ANSI colour, so it learns which block
+            is the answer from this marker. Commentary printed beside a tool
+            call must not raise it, or the whole transcript turns blue.
+            """
+            class Pane(io.StringIO):
+                encoding = "utf-8"
+                marks = 0
+
+                def isatty(self) -> bool:
+                    return False
+
+                def answer_start(self) -> None:
+                    self.marks += 1
+
+            pane = Pane()
+            talker = make_harness()
+            sent: list[dict[str, Any]] = []
+            talker.client = fake_client(
+                [
+                    fake_response(content="let me look",
+                                  tool_calls=[fake_call("c1", "list_files", {})]),
+                    fake_response(content="the answer"),
+                ],
+                sent,
+            )
+            with contextlib.redirect_stdout(pane):
+                result = talker.run("check it")
+            assert result == "the answer", result
+            assert pane.marks == 1, f"expected one answer marker, got {pane.marks}"
+            blocks = pane.getvalue().count(glyphs()["dot"] + " assistant")
+            assert blocks == 2, (blocks, pane.getvalue())
+
+        check("the answer marker fires once, on the answering block",
+              _answer_marker_only_for_the_answer)
 
         def _loop_recovers_from_bad_json() -> None:
             bad = make_harness()

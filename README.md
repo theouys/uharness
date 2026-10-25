@@ -162,7 +162,9 @@ The agent adjusts to its environment in three places:
   them, so it stays readable on a bare console.
 - **Colour.** ANSI colour switches itself off when output is piped or
   redirected, and is disabled entirely by `NO_COLOR=1`, `TERM=dumb`, or when
-  `CLICOLOR_FORCE` is unset and stdout is not a TTY.
+  `CLICOLOR_FORCE` is unset and stdout is not a TTY. The model's final answer
+  is the one block drawn in light blue, so it stands out from the green
+  running commentary; the desktop window follows the same rule.
 - **Process killing.** Timeouts kill the whole process tree — via process
   groups on POSIX and `taskkill /T` on Windows.
 

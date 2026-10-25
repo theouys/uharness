@@ -85,6 +85,7 @@ YELLOW = "#e8c547"
 RED = "#ff6b6b"
 MAGENTA = "#c792ea"
 BLUE = "#8ab4f8"
+ANSWER = "#add8e6"      # light blue: the model's final answer, not commentary
 SEP = "#4a4f57"
 
 TAG_COLOURS: dict[str, dict[str, Any]] = {
@@ -92,6 +93,7 @@ TAG_COLOURS: dict[str, dict[str, Any]] = {
     "dim": {"foreground": DIM},
     "you": {"foreground": BLUE, "font_bold": True},
     "assistant": {"foreground": GREEN, "font_bold": True},
+    "answer": {"foreground": ANSWER},
     "tool": {"foreground": CYAN, "font_bold": True},
     "result": {"foreground": DIM},
     "warn": {"foreground": YELLOW},
@@ -150,7 +152,15 @@ def classify_line(line: str) -> str:
         if word in {"free", "paid"}:
             return "badge"
         return "dim"
-    if glyph in {"\u2699", ">"}:                       # ⚙ write_file / > run
+    if glyph == "\u2022":                              # • usage / • context / • info
+        # Plumbing notices are dim in the terminal, label or no label. The
+        # ASCII fallback glyph is "-", where only a label gives it away, so
+        # that case is handled below and a bare "-" line stays body text.
+        return "dim"
+    if glyph == "-" and word in {"usage", "context"}:
+        return "dim"
+    if glyph in {"\u2699", "\u25b8", "\u21bb", ">", "~"}:
+        # ⚙ tool call, ▸ run, ↻ retry (">" and "~" are their ASCII fallbacks)
         if word == "skill":
             return "skill"
         if word == "run":
@@ -211,6 +221,15 @@ class PaneStream:
 
     def flush(self) -> None:
         return None
+
+    def answer_start(self) -> None:
+        """Called by the harness just before it prints the final answer.
+
+        The pane cannot read the harness's colour codes (it strips them), so
+        this marker is what tells it which block is the answer and should be
+        drawn in light blue instead of the usual green commentary.
+        """
+        self.events.put(("answer",))
 
     def isatty(self) -> bool:
         return False
@@ -405,6 +424,7 @@ class HarnessUI:
 
         self.events: queue.Queue = queue.Queue()
         self.pending_text = ""         # a line the harness has not finished
+        self.answering = False         # the next block is the final answer
         self.busy = False
         self.worker_ident: int | None = None
         self.approvals: list[dict[str, Any]] = []
@@ -773,13 +793,28 @@ class HarnessUI:
             return
         pairs: list[tuple[str | None, str]] = []
         for line in lines:
-            tag = classify_line(line)
+            tag = self._answer_tag(line, classify_line(line))
             text = line + "\n"
             if pairs and pairs[-1][0] == tag:
                 pairs[-1] = (tag, pairs[-1][1] + text)
             else:
                 pairs.append((tag, text))
         self._insert(pairs)
+
+    def _answer_tag(self, line: str, tag: str) -> str:
+        """Keep the final answer's heading and rail rows in the answer colour.
+
+        The flag is set by the harness's `answer_start()` marker and cleared
+        by the first line that cannot belong to the block, so a later tool
+        call or notice goes back to its normal colour.
+        """
+        if not self.answering:
+            return tag
+        stripped = line.strip()
+        if not stripped or tag == "assistant" or stripped[:1] in {"\u2502", "|"}:
+            return "answer"
+        self.answering = False
+        return tag
 
     # -- the queue pump ----------------------------------------------------- #
 
@@ -795,6 +830,13 @@ class HarnessUI:
                 kind = item[0]
                 if kind == "text":
                     self.pending_text += item[1]
+                elif kind == "answer":
+                    # Flush what came before so it keeps its own colour, then
+                    # mark the block that starts on the next line.
+                    if self.pending_text:
+                        self.pending_text += "\n"
+                    self._flush_text()
+                    self.answering = True
                 elif kind == "approval":
                     _, box, action, detail, dangerous = item
                     self.show_approval(box, action, detail, dangerous)
@@ -863,6 +905,9 @@ class HarnessUI:
             self.notice("warn", "a request is already running - wait or press Stop")
             return
         self.busy = True
+        # A fresh request starts in commentary colour, whatever the last turn
+        # left behind (an interrupted answer never reached finish_busy).
+        self.answering = False
         self.state.configure(text=label)
         self.send_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
@@ -886,6 +931,7 @@ class HarnessUI:
         self._flush_text()
         if self.pending_text:
             self.write(self._take_pending() + "\n")
+        self.answering = False
         if error is not None:
             if isinstance(error, KeyboardInterrupt):
                 self.notice("warn", "interrupted - back at the prompt")
@@ -1108,8 +1154,12 @@ class HarnessUI:
                     prefix = "\u276f " if index == 0 else "  "
                     self.write(prefix + line + "\n", "you")
             elif role == "assistant" and content.strip():
+                # A message with no tool calls after it was the answer to its
+                # request, so it is replayed in the answer colour.
+                final = not message.get("tool_calls")
                 self.write("\n" + core.assistant_block(
-                    core.clip(content, 4_000, keep="head")) + "\n", "body")
+                    core.clip(content, 4_000, keep="head"),
+                    final=final) + "\n", "answer" if final else "body")
         self.separator()
 
     def reset_conversation(self) -> None:
@@ -1176,6 +1226,7 @@ class HarnessUI:
 
     def clear_pane(self) -> None:
         self.pending_text = ""
+        self.answering = False
         try:
             self.feedback.configure(state="normal")
             self.feedback.delete("1.0", "end")
