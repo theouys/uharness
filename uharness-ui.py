@@ -471,6 +471,7 @@ class HarnessUI:
             log_path=Path(self.args.log).expanduser() if self.args.log else None,
             show_usage=self.args.usage,
             autosave=not self.args.no_autosave,
+            tester=self.args.tester,
         )
         self.install_approver(harness)
         return harness
@@ -1045,7 +1046,7 @@ class HarnessUI:
         if word in {"/exit", "/quit"}:
             self.on_close()
         elif word in {"/help", "/?"}:
-            core.show_commands()
+            core.show_commands(self.harness.tester)
         elif word == "/save":
             self.save_conversation(argument)
         elif word == "/open":
@@ -1311,7 +1312,7 @@ class HarnessUI:
                 f"workspace:  {harness.workspace}",
                 f"sessions:   {harness.rel(harness.sessions_dir)}",
                 f"skills:     {harness.skills.describe_roots()}",
-                f"tools:      {len(core.TOOLS)}",
+                f"tools:      {len(harness.tools)}",
                 f"autosave:   {'on' if harness.autosave else 'off'}",
                 "",
                 f"uharness.py {Path(core.__file__).resolve()}",
@@ -1348,16 +1349,25 @@ class HarnessUI:
     def announce(self) -> None:
         """The startup panel, into the pane instead of the terminal."""
         harness = self.harness
-        self.write(core.banner() + "\n", "banner")
+        self.write(core.banner(tester=harness.tester) + "\n", "banner")
 
         rows: list[tuple[str, str]] = [
             ("model", harness.model),
             ("profile", "free" if harness.free else "paid"),
             ("workspace", str(harness.workspace)),
-            ("tools", f"{len(core.TOOLS)} available"),
+            ("tools", f"{len(harness.tools)} available"),
         ]
+        if harness.tester:
+            rows.append(("role", f"tester (writes only "
+                                 f"{core.REPORT_PATH.as_posix()})"))
         if harness.dry_run:
             rows.append(("mode", "dry run (nothing will be changed)"))
+        elif harness.tester:
+            rows.append((
+                "approval",
+                "auto (--yes)" if harness.auto_approve
+                else "ask before report writes and commands",
+            ))
         else:
             rows.append((
                 "approval",

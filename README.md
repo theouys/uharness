@@ -9,6 +9,24 @@ edits them, runs commands, and asks your permission before it changes anything.
 You can watch every step, approve or reject each action, and stop it with
 Ctrl+C at any point.
 
+**It can play either side of a code review.** By default it is a **developer**:
+it reads, writes and runs things to build what you asked for. Start it with
+`--tester` and the same program becomes a **tester**: it reads a handover, tests
+someone else's work, and reports what is broken — while being physically unable
+to change the code it is judging. That makes a full two-agent loop possible from
+one file:
+
+```
+developer            .harness_sessions/Testing.md            tester
+uharness.py    ->    status: READY FOR TESTING       ->   uharness.py --tester
+     ^                                                          |
+     +----- status: FAILED / PASSED, with the findings <--------+
+```
+
+Each side writes the same plain-text file, so the handover between them survives
+a crashed session, a different terminal, or a different agent entirely. See
+[Developer or tester: two modes](#developer-or-tester-two-modes).
+
 It is a single Python file with one dependency. There is no framework, no daemon
 and no server — you run it, it does the task, it exits.
 
@@ -20,6 +38,70 @@ Source code: [github.com/theouys/uharness](https://github.com/theouys/uharness)
 
 Bug reports, questions and pull requests are welcome — open an issue on the
 tracker and describe what you ran, what you expected and what happened instead.
+
+---
+
+## Developer or tester: two modes
+
+One file, two jobs. The flag decides which, and it changes three things: the
+system prompt, the tool menu, and what the write tools will touch.
+
+| | Developer (default) | Tester (`--tester`) |
+|---|---|---|
+| Job | Build or change the code | Check someone else's work and report defects |
+| System prompt | "you are a coding assistant" | "you are a software tester" — never fix, only report |
+| Tools offered | 8 | 7 — no `delete_file` |
+| May write | Anything inside the workspace | **Only** `.harness_sessions/Testing.md` |
+| May delete | Yes, with approval | No, not even the report |
+| Startup logo | `U · H A R N E S S` | `U · T E S T E R` |
+
+The tester's restriction is not a prompt instruction that the model could talk
+itself out of — it is enforced in the tool layer. `resolve_write()` refuses
+every path but the report and says where the finding belongs instead, so a
+tester run cannot damage the code it is reviewing even if the model tries.
+
+### The handover file
+
+Both modes talk through `.harness_sessions/Testing.md`, a plain Markdown file
+with a `Status:` line at the top and an append-only log underneath:
+
+| Status | What the tester does |
+|--------|----------------------|
+| *(file missing)* | No handover — say so and stop. |
+| `READY FOR TESTING` | Test it. The only status that means work. |
+| `PASSED` | Accepted. Report it and stop. |
+| `FAILED` | Not fixed yet. Report it and stop. |
+| `BLOCKED` | Something must be unblocked first. |
+| `WITHDRAWN` | The handover was pulled. |
+
+The developer writes the criteria and the exact verification commands, self-tests
+first, and stops. The tester reproduces those commands, probes the edges, and
+appends a numbered defect list plus one of those statuses. The log is never
+rewritten, so it doubles as the audit trail of what was fixed between rounds.
+
+### Using it
+
+Build something, then hand it over:
+
+```bash
+uharness --yes "Add a --json flag to cli.py and write a handover to .harness_sessions/Testing.md"
+uharness --tester --yes "test the handover in .harness_sessions/Testing.md"
+```
+
+The second command comes back with findings; because the tester cannot edit the
+code, fixing them is the developer's next turn:
+
+```bash
+uharness --yes "fix the defects in .harness_sessions/Testing.md round 2"
+uharness --tester --yes
+```
+
+The tester is told to read the status line first, so a run against `PASSED` or
+`FAILED` stops instead of inventing work. The status word belongs to the tester
+alone — a developer that marks its own work `PASSED` has broken the loop.
+
+Both modes work in the [desktop window](#desktop-window) too:
+`python3 uharness-ui.py --tester` shows the same `U · T E S T E R` panel.
 
 ---
 
@@ -59,6 +141,7 @@ See [Getting an API key](#getting-an-api-key) for the details, or
 
 ## Contents
 
+- [Developer or tester: two modes](#developer-or-tester-two-modes)
 - [Free by default, paid on demand](#free-by-default-paid-on-demand)
 - [Prerequisites](#prerequisites)
 - [Supported platforms](#supported-platforms)
@@ -406,6 +489,9 @@ bindings added.
   unknown commands are warned about, never sent to the model
 ```
 
+Start with `--tester` and two lines change: the `/approve` row reads "ask before
+report writes and commands", and the panel reports 7 tools instead of 8.
+
 ---
 
 ## Command-line reference
@@ -424,6 +510,7 @@ one argument. If you give no prompt, you drop straight into interactive mode.
 | `-h`, `--help` | | Show the built-in help and exit. |
 | prompt | *(interactive)* | The task to run. Omitted entirely, starts interactive mode. |
 | `-i`, `--interactive` | off | Run the prompt (if any), then stay open for more. |
+| `--tester` | off | Run as the tester half of the loop: read `.harness_sessions/Testing.md`, test what it describes, report defects there. The write tools accept that one path only and `delete_file` is not offered. See [two modes](#developer-or-tester-two-modes). |
 | `-y`, `--yes` | off | Auto-approve writes, edits, deletes and command execution. Does **not** lift the dangerous-command blocklist. |
 | `--allow-dangerous` | off | Also permit commands matching the dangerous blocklist. Needs approval as well. |
 | `--dry-run` | off | Report what would change; change nothing. |
@@ -481,6 +568,9 @@ uharness --yes --max-turns 40 "Update every dependency reference"
 
 # Record the whole session for later reference
 uharness --log session.jsonl "Investigate why the build fails"
+
+# Play the other role: test a handover and report defects
+uharness --tester --yes "test the handover in .harness_sessions/Testing.md"
 ```
 
 ---
@@ -519,6 +609,10 @@ Several things are blocked regardless of how you answer:
   both.
 - **Non-interactive safety.** If stdin is not a terminal and `--yes` was not
   given, write actions are denied rather than silently approved.
+- **The tester fence.** With `--tester` only `.harness_sessions/Testing.md` may
+  be written, and `delete_file` is not in the tool menu at all. `--yes` does not
+  lift it: nothing else in the workspace can be created, changed or removed, so
+  a reviewing run cannot damage what it is reviewing.
 
 The blocklist is a guard rail, not a sandbox. It catches common catastrophes and
 obvious mistakes; it cannot anticipate everything. **Run the agent in a
@@ -646,11 +740,14 @@ python3 uharness-ui.py "Summarise README.md"    # ask straight away
 python3 uharness-ui.py --workspace ~/project --yes
 ```
 
-It accepts every option `uharness.py` accepts — `--yes`, `--dry-run`,
-`--thinking`, `--usage`, `--verbosity`, `-m`, `--max-turns`,
+It accepts every option `uharness.py` accepts — `--tester`, `--yes`,
+`--dry-run`, `--thinking`, `--usage`, `--verbosity`, `-m`, `--max-turns`,
 `--command-timeout`, `--log`, `--selftest` and the rest — and every slash
 command works when typed into the prompt box, exactly as in the terminal. An
 unknown slash command still only prints a warning and never reaches the model.
+With `--tester` the window shows the `U · T E S T E R` panel and the same
+report-only fence: the code stays read-only, and the report is the one writable
+file.
 
 The menu bar mirrors those commands, so nothing has to be memorised:
 
@@ -842,8 +939,13 @@ The agent is a tool-calling loop:
 | `edit_file` | yes | Replace an exact substring. Fails if the match is missing or ambiguous. |
 | `write_file` | yes | Create or overwrite a file. |
 | `append_file` | yes | Append to a file. |
-| `delete_file` | yes | Delete a file, or a directory with `recursive=true`. |
+| `delete_file` | yes | Delete a file, or a directory with `recursive=true`. **Not offered in `--tester` mode.** |
 | `execute_command` | yes | Run a shell command with a timeout. |
+
+In `--tester` mode the write tools are still listed but pointed at one path:
+`write_file`, `edit_file` and `append_file` accept only
+`.harness_sessions/Testing.md`, and the description the model reads says so. See
+[two modes](#developer-or-tester-two-modes).
 
 A few deliberate design choices:
 
@@ -903,6 +1005,17 @@ The blocklist matched. If it is a false positive, rerun with
 The agent may only touch files under the workspace. `cd` to the right place, or
 pass `-w /path/to/project`.
 
+**`'...' is the code under test, and this is a tester run`.**
+You are in `--tester` mode, which may write only
+`.harness_sessions/Testing.md`. That is the whole point: findings go in the
+report, never into the code. Drop `--tester` if you actually meant to edit
+things — but then you are the developer, and the tester should be the one
+judging the result.
+
+**The tester does nothing and says the status is `PASSED` (or `FAILED`).**
+Working as designed — those statuses mean "already handled", so it stops instead
+of re-testing. Set the header back to `READY FOR TESTING` for a new round.
+
 **Backspace prints `^?` or the arrow keys type `^[[A`.**
 The terminal is not being driven in raw mode. Setting `HARNESS_INPUT=builtin`
 gives Python's plain `input()`, which is uglier but more compatible.
@@ -946,13 +1059,19 @@ It exercises path confinement, the file tools, ambiguous and CRLF-safe edits,
 search, the delete guards, dry-run, command execution and timeouts, tree
 killing, the approval logic, output bounding, the line editor's wrapping, history
 compaction, saved sessions, skill loading (from the workspace and from the
-folder beside `uharness.py`) and the agent loop (against a fake client).
+folder beside `uharness.py`), the tester fence (report-only writes, no
+`delete_file`, the mode's prompt and logo) and the agent loop (against a fake
+client).
 Expected output:
 
 ```
-selftest: 54/54 checks passed
+selftest: 70/70 checks passed
 All tool-layer checks passed (no network used).
 ```
+
+The same checks run in either mode — `uharness --tester --selftest` prints the
+same 70/70, because a tester run should be able to verify its own tool layer
+before it judges anyone else's work.
 
 The exact count moves as checks are added or removed, so treat it as a shape
 rather than a number: what matters is that no `FAIL` line appears and the exit
@@ -965,7 +1084,8 @@ need to observe a non-interactive denial.
 
 ```
 uharness                  Launcher script. Runs the agent in your cwd.
-uharness.py               The entire agent. Single file, ~4,500 lines.
+uharness.py               The entire agent. Single file, ~5,650 lines. Coder
+                          by default, tester with --tester.
 uharness-ui.py            tkinter front-end: same agent, in a window.
 uharness-ui-launcher      Shell launcher behind the desktop icon / PATH command.
 uharness-ui.desktop       Application-grid entry (template; see the installer).
@@ -974,6 +1094,9 @@ install-launcher.sh       Installs the three above under ~/.local (and removes).
 skills/                   Skill packs, searched from every workspace.
 ├── always-be-funny/
 │   └── SKILL.md          Example skill.
+├── handover-to-tester/
+│   ├── SKILL.md          Developer side of the dev -> tester loop.
+│   └── Testing.template.md  Shape for .harness_sessions/Testing.md.
 └── test/
     └── SKILL.md          Example skill: inventory a folder into report.md.
 .harness_sessions/        Autosaved conversations, written as you chat.

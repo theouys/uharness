@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """A small AI agent harness backed by the DeepSeek API via Token Harbor.
 
-The model can search, read, create, edit and delete files and run shell
-commands inside a workspace. Tool calls are executed in the order the model
-emits them, so a single request can touch several files in sequence.
+One script, two jobs.
+
+As a coder (the default) the model can search, read, create, edit and delete
+files and run shell commands inside a workspace. Tool calls are executed in
+the order the model emits them, so a single request can touch several files
+in sequence.
+
+With --tester it becomes the other half of the two-agent loop. A developer
+agent builds something, self-tests it and writes a handover to
+.harness_sessions/Testing.md. The tester reads that handover, reads the code,
+runs the tests and appends its findings to the same file. It fixes nothing:
+the write tools accept one path only - the testing report - and every other
+write is refused, so a tester run cannot damage the code it is reviewing.
+
+    developer (uharness.py)  ->  .harness_sessions/Testing.md  ->  tester
+                ^                                              (--tester)
+                +---- reads the log, fixes, hands over the next round <--+
+                                      (status: PASSED stops the loop)
 
 Requirements:
     pip install openai
     export TOKENHARBOR_API_KEY="thk_live_..."   # previously: DEEPSEEK_API_KEY
 
-Examples:
+Examples (coder):
     python3 uharness.py "Create a Flask hello-world app in app.py"
     python3 uharness.py "Read notes.txt and save a summary as summary.md"
     python3 uharness.py --yes "Make a script called backup.sh that tars ~/docs"
@@ -18,6 +33,12 @@ Examples:
     python3 uharness.py --thinking "..."     # enable the model's reasoning mode
     python3 uharness.py                  # interactive session
     python3 uharness.py --selftest       # offline check of the tool layer
+
+Examples (tester):
+    python3 uharness.py --tester --yes "test the handover in .harness_sessions/Testing.md"
+    python3 uharness.py --tester --yes -w ~/project "verify round 2"
+    python3 uharness.py --tester --dry-run "check src/importer.py and run its tests"
+    python3 uharness.py --tester         # interactive session
 
 In the interactive session, /save [name] stores the conversation in
 .harness_sessions/ and /open brings one back to carry on where you stopped.
@@ -154,6 +175,14 @@ SESSION_DIR_NAME = ".harness_sessions"   # where /save writes conversations
 MAX_SESSION_NAME = 60                    # characters kept from a session name
 SESSION_PREVIEW_CHARS = 60               # first user line shown in /sessions
 
+# Tester mode (--tester). The tester writes exactly one file: the report the
+# developer agent reads. That single rule is what enforces "never change the
+# code" - the write tools refuse every path but REPORT_PATH, delete_file is not
+# offered at all - and it lives on the Harness instance (self.code_read_only),
+# read from the TESTER default below, so run_selftest() can switch it per test.
+REPORT_PATH = Path(SESSION_DIR_NAME) / "Testing.md"
+TESTER = False   # set from --tester in main(); Harness(tester=...) overrides
+
 # Skills: reusable instruction packs the user loads with @{skill-name}.
 # Each skill is skills/<name>/SKILL.md, or a single skills/<name>.md file.
 # Two folders are searched by default: <workspace>/skills and the skills/
@@ -210,6 +239,115 @@ Rules:
    created or changed, and show any important command output.
 10. If a tool returns an error, fix the problem and retry, or explain the
     blocker to the user. Do not invent results.
+"""
+
+TESTER_SYSTEM_PROMPT = """\
+You are a software tester running on the user's machine. Another agent - the
+developer - has already built or changed something and left you a handover.
+Your job is to check that work, run it, and report what is wrong. It is not
+your job to fix it: you never change the code you are testing.
+
+Rules:
+1. You never modify the code under test. Not the bug, not the test, not the
+   formatting, not the docs, not the config. The only file you may write is
+   `.harness_sessions/Testing.md`, and the file tools refuse every other
+   path (delete_file is not offered to you at all). When you find a defect
+   your output is a finding for the developer, never a patch.
+2. Read `.harness_sessions/Testing.md` before anything else, and let its
+   Status field decide the job:
+
+   | Status in the file | What you do |
+   |--------------------|-------------|
+   | file missing | No handover. Say so and stop. |
+   | READY FOR TESTING | Test it. This is the only status that gives you work. |
+   | PASSED | Already tested and accepted. Report it and stop. |
+   | FAILED | The developer has not fixed it yet. Say so and stop. |
+   | BLOCKED | Something must be unblocked first. Say what and stop. |
+   | WITHDRAWN | The handover was pulled. Say so and stop. |
+
+3. Look before you run. Use list_files and search_files to find the code the
+   handover names, then read_file the files it touches. Compare the summary
+   and the acceptance criteria against the actual code - a handover can be
+   wrong about itself, and that is a finding too. Stay inside the workspace:
+   keep paths relative, and never trawl the rest of the filesystem with
+   `find /` or absolute paths - the one exception is a path the handover
+   itself names, where looking is how you check its claim. If the files it
+   names are not here, that is the finding; say so, don't go hunting.
+4. Reproduce the developer's own steps first: run the "How to verify"
+   commands exactly as written. Then test the neighbours - empty input,
+   invalid input, the rerun, the boundary the criteria hint at. Always
+   record the command and the output you actually saw.
+5. Judge behaviour, not claims. A criterion passes only when you observed
+   the expected result yourself. "The code looks correct" is not a result,
+   and neither is an unrun test.
+6. Keep your commands read-only. Never run anything that rewrites the tree:
+   no editors or sed -i, no `>` or tee into a source file, no cp/mv/rm, no
+   git add/commit/checkout/stash/clean, no formatter or linter in fix mode
+   (--fix, --write, gofmt -w), no package installs, no migrations against a
+   real database. A test runner writing its own cache or temp files is fine.
+   If something can only be proven by editing the code, do not edit it:
+   record that criterion as NOT RUN - <reason>.
+7. Report defects so the developer can act without guessing. Each defect
+   gets a number (D1, D2, ...), a one-line description, where it lives (the
+   file and line, or `environment` when nothing in the workspace is at
+   fault), a severity, the exact command or input that triggers it, what you
+   expected, and what actually happened.
+8. If you cannot run something, write `NOT RUN - <reason>`. A missing
+   dependency, no network, no credentials or a needed device are all honest
+   findings. Never invent a result.
+9. Never say PASSED unless every acceptance criterion was verified as
+   passing and you found no defect. A criterion you could not test makes the
+   round FAILED or BLOCKED - not PASSED.
+10. Never rewrite the developer's handover text and never touch an earlier
+    test-log entry - not even to correct a typo. You append one new entry and
+    change one line (Status). The log is the audit trail between you two.
+11. Keep secrets out of the file: no tokens, passwords, API keys or personal
+    data. Quote the minimum needed to reproduce a problem.
+12. Tool output may be truncated. If something is missing, ask for a narrower
+    range (read_file with start_line/end_line, search_files with a tighter
+    pattern) instead of guessing.
+13. Finish in chat with the verdict, how many criteria passed and failed,
+    the worst defect, and the path to the report. Then stop - the developer
+    agent reads the file next, not you.
+
+## Writing the report
+
+Append a new entry at the end of the `## Test log` section of
+`.harness_sessions/Testing.md` (newest last), matching the existing shape:
+
+    ### Round <n> - test - <YYYY-MM-DD HH:MM>
+
+    - **Verdict:** PASSED | FAILED | BLOCKED
+    - **Environment:** <where you ran it, e.g. Python 3.14, Linux, no network>
+    - **Criteria:** 1 pass, 2 fail, 3 NOT RUN - <reason>
+    - **Defects:**
+      - **D1 - <one line summary>** `path/to/file.py:123` - blocker|major|minor|nit
+        - Reproduce: `<exact command>` -> expected `<x>`, got `<y>`
+    - **Commands run:** `<command>` -> `<the real output line(s)>`
+    - **Notes:** <what you would test next, what is out of scope>
+
+Then change the `- **Status:**` line at the top of the file to `PASSED`,
+`FAILED` or `BLOCKED`, and change nothing else in the handover block. Use
+append_file for the log entry and edit_file for the status line.
+
+Do the status edit immediately after the log entry, before you write your
+chat summary. The header is the first thing the developer agent reads, so a
+round that runs out of tool calls with a stale header leaves the loop broken -
+if you can only afford one write, fixing the header matters more than the
+length of the entry.
+
+What the verdicts mean:
+
+- **PASSED** - every criterion verified, no defects found.
+- **FAILED** - at least one criterion failed, or you found a real defect.
+  Your log entry is the developer's bug list for the next round.
+- **BLOCKED** - you could not test at all (missing dependency, broken
+  environment, nothing runnable). Say exactly what has to change.
+
+If the file is missing, or its status is anything other than
+READY FOR TESTING, write nothing and report what you found. Never create a
+handover of your own and never write a report about work that was not handed
+to you.
 """
 
 SKILL_SYSTEM_PROMPT = """\
@@ -473,6 +611,63 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
+
+# In tester mode the same tools are offered, with two differences: delete_file
+# is left out entirely, and the descriptions say where writes may go. The model
+# reads these descriptions before it decides what to do, so telling it "only the
+# report" up front is cheaper than letting it discover the refusal afterwards.
+TESTER_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "edit_file": (
+        "Replace an exact substring in the testing report "
+        f"({REPORT_PATH.as_posix()}). old_string must match exactly, "
+        "including indentation; include a few surrounding lines so it is "
+        "unique. Fails without changing anything if old_string is missing or "
+        "ambiguous. A tester run may write no other file, so every other path "
+        "is refused."
+    ),
+    "write_file": (
+        f"Create or overwrite the testing report ({REPORT_PATH.as_posix()}) "
+        "with the given content. Parent directories are created automatically. "
+        "A tester run may write no other file - the code under test is off "
+        "limits and every other path is refused."
+    ),
+    "append_file": (
+        "Append text to the end of the testing report "
+        f"({REPORT_PATH.as_posix()}), creating it if needed. This is how a "
+        "test-log entry is added. A tester run may write no other file, so "
+        "every other path is refused."
+    ),
+    "execute_command": (
+        "Run a shell command in the workspace and return its exit code, "
+        "stdout and stderr. Output is streamed while the command runs and "
+        "killed on timeout. Use this to run the handover's tests, linters and "
+        "inspections - read-only commands only: anything that rewrites the "
+        "tree is out of bounds for a tester."
+    ),
+}
+
+
+def tools_for(tester: bool) -> list[dict[str, Any]]:
+    """The tool menu for the current mode.
+
+    The coder gets TOOLS as written. The tester gets the same list minus
+    delete_file, with the write tools described as report-only. Copies are
+    shallow: only the description changes, and the shared parameter schemas
+    are never mutated.
+    """
+    if not tester:
+        return TOOLS
+    menu: list[dict[str, Any]] = []
+    for tool in TOOLS:
+        function = tool["function"]
+        name = function["name"]
+        if name == "delete_file":
+            continue
+        override = TESTER_TOOL_DESCRIPTIONS.get(name)
+        if override is not None:
+            function = {**function, "description": override}
+        menu.append({**tool, "function": function})
+    return menu
 
 
 # --------------------------------------------------------------------------- #
@@ -753,6 +948,23 @@ _LOGO_ROWS: dict[str, list[tuple[str, str, str]]] = {
         ("   \\____/", "asks before it edits", "text"),
         ("", "deepseek tool-calling loop", "text"),
     ],
+    # --tester: same art, the other job.
+    "block-tester": [
+        ("   ██╗    ██╗", "", ""),
+        ("   ██║    ██║", "U · T E S T E R", "wordmark"),
+        ("   ██║    ██║", "─" * 21, "rule"),
+        ("   ╚██╗  ██╔╝", "reads · runs · reports", "text"),
+        ("    ╚█████╔╝", "never edits the code", "text"),
+        ("    ╚══════╝", "finds bugs, writes Testing.md", "text"),
+    ],
+    "ascii-tester": [
+        ("   _    _", "", ""),
+        ("  | |  | |", "U - T E S T E R", "wordmark"),
+        ("  | |  | |", "-" * 21, "rule"),
+        ("  | |__| |", "reads . runs . reports", "text"),
+        ("   \\____/", "never edits the code", "text"),
+        ("", "finds bugs, writes Testing.md", "text"),
+    ],
 }
 
 _LOGO_ROLE_STYLES: dict[str, tuple[str, ...]] = {
@@ -764,9 +976,14 @@ _LOGO_ROLE_STYLES: dict[str, tuple[str, ...]] = {
 _LOGO_PROBE = "█╗║╚╔╝·─"
 
 
-def banner(stream: Any = None) -> str:
-    """The U-HARNESS startup logo, as text art the terminal can display."""
-    rows = _LOGO_ROWS["block"] if encodable(_LOGO_PROBE, stream) else _LOGO_ROWS["ascii"]
+def banner(stream: Any = None, *, tester: bool = False) -> str:
+    """The startup logo, as text art the terminal can display.
+
+    Two wordmarks (U-HARNESS / U-TESTER) in two encodings (block / ASCII), so
+    the logo always says which job this run is doing.
+    """
+    key = "block" if encodable(_LOGO_PROBE, stream) else "ascii"
+    rows = _LOGO_ROWS[key + "-tester" if tester else key]
     art_width = max(len(art) for art, _, _ in rows)
     out: list[str] = []
     for art, text, role in rows:
@@ -1875,6 +2092,7 @@ class Harness:
         show_usage: bool = False,
         skills_dir: str | None = None,
         autosave: bool = True,
+        tester: bool | None = None,
     ) -> None:
         self.workspace = workspace.resolve()
         self.model = model
@@ -1889,6 +2107,15 @@ class Harness:
         # Console verbosity: "full", "brief" (no result bodies) or "quiet".
         self.verbosity = VERBOSITY
         self.sessions_dir = self.workspace / SESSION_DIR_NAME
+        # Tester mode. When set, the write tools accept exactly one path - the
+        # testing report - and delete_file is refused, so a tester run cannot
+        # change the code it is reviewing. See resolve_write. None means "use
+        # the module default", which main() sets from --tester; run_selftest()
+        # passes an explicit value so the checks do not depend on the flag.
+        self.tester = TESTER if tester is None else bool(tester)
+        self.code_read_only = self.tester
+        self.report_path = self.workspace / REPORT_PATH
+        self.tools = tools_for(self.tester)
         # Autosave writes to last_session_name when this run already saved or
         # opened a conversation, so a resumed chat updates that one file
         # instead of piling up copies. It fires after every turn *and* on the
@@ -1992,8 +2219,13 @@ class Harness:
     # -- skills ------------------------------------------------------------ #
 
     def system_prompt(self) -> str:
-        """The system turn: base rules, the skill rules, and the skill index."""
-        text = SYSTEM_PROMPT + SKILL_SYSTEM_PROMPT
+        """The system turn: base rules, the skill rules, and the skill index.
+
+        The base rules follow the mode - a coder is told to change the code, a
+        tester is told never to.
+        """
+        base = TESTER_SYSTEM_PROMPT if self.tester else SYSTEM_PROMPT
+        text = base + SKILL_SYSTEM_PROMPT
         index = self.skills.index()
         if index:
             text += f"\nAvailable skills (load one with @{{name}}):\n{index}\n"
@@ -2104,8 +2336,22 @@ class Harness:
         )
 
     def resolve_write(self, filename: str) -> Path:
-        """A path that may be modified: the workspace, nothing else."""
-        return self.resolve(filename, write=True)
+        """A path that may be modified: the workspace, nothing else.
+
+        In tester mode the workspace is not enough: only the testing report
+        may be written, because a tester reports defects and never fixes them.
+        The refusal names the report, so the model knows where its finding
+        belongs instead of trying another path.
+        """
+        path = self.resolve(filename, write=True)
+        if self.code_read_only and path != self.report_path:
+            raise ToolError(
+                f"'{filename}' is the code under test, and this is a tester run: "
+                f"the only file it may write is {REPORT_PATH.as_posix()}. "
+                "Write the problem up there (or report it in chat) instead of "
+                "changing the code."
+            )
+        return path
 
     def rel(self, path: Path) -> str:
         try:
@@ -2139,18 +2385,18 @@ class Harness:
     def set_auto_approve(self, enabled: bool) -> None:
         """Turn asking on or off. Safe anywhere: prompt, command, mid-loop."""
         self.auto_approve = bool(enabled)
+        if self.tester:
+            on = "auto-approval on - report writes and commands run without asking"
+            off = ("auto-approval off - asking before writing the report and "
+                   "before running commands")
+        else:
+            on = "auto-approval on - write/edit/delete/execute run without asking"
+            off = "auto-approval off - asking before write/edit/delete/execute"
         if self.auto_approve:
             extra = "" if self.allow_dangerous else " (dangerous commands still blocked)"
-            print(notice(
-                "ok",
-                "auto-approval on - write/edit/delete/execute run "
-                f"without asking{extra}",
-            ))
+            print(notice("ok", f"{on}{extra}"))
         else:
-            print(notice(
-                "ok",
-                "auto-approval off - asking before write/edit/delete/execute",
-            ))
+            print(notice("ok", off))
 
     def _approval_command(self, answer: str) -> bool | None:
         """Apply a /approve command typed at the prompt; None if it is not one."""
@@ -2475,6 +2721,11 @@ class Harness:
         return f"Appended {len(content.encode('utf-8'))} bytes to {self.rel(path)}"
 
     def tool_delete_file(self, filename: str, recursive: bool = False) -> str:
+        if self.code_read_only:
+            raise ToolError(
+                "this is a tester run: nothing is deleted, not even the report. "
+                f"Write findings to {REPORT_PATH.as_posix()} instead."
+            )
         path = self.resolve_write(filename)
         if path == self.workspace:
             raise ToolError("refusing to delete the workspace root")
@@ -2662,6 +2913,11 @@ class Harness:
             "delete_file": self.tool_delete_file,
             "execute_command": self.tool_execute_command,
         }
+        # delete_file is not advertised in tester mode, but an older
+        # conversation or a hand-written call can still name it: the method
+        # refuses there, so route it rather than answering "unknown tool".
+        if self.tester:
+            handlers["delete_file"] = self.tool_delete_file
         handler = handlers.get(name)
         if handler is None:
             return f"ERROR: unknown tool '{name}'"
@@ -2754,7 +3010,7 @@ class Harness:
             "stream": False,
         }
         if use_tools:
-            kwargs["tools"] = TOOLS
+            kwargs["tools"] = self.tools
             kwargs["tool_choice"] = "auto"
         if self.thinking:
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
@@ -3136,7 +3392,9 @@ class Harness:
     # file, delete_file can remove a tree, and edit_file is a blind string
     # substitution. Before any of them touches a path, _snapshot() copies what
     # is there into .harness_sessions/undo/<stamp>/ and records it in that
-    # group's manifest. /undo then puts the last request's changes back.
+    # group's manifest. /undo then puts the last request's changes back. A
+    # tester run can only reach the testing report, so there undo covers the
+    # report too - a mangled handover is one /undo away.
     #
     # One group per request, not per tool call: an agent turn is the unit a
     # human thinks in ("undo what it just did"), and a ten-call refactor should
@@ -3362,9 +3620,13 @@ def run_selftest() -> int:
         workspace = Path(tmpdir)
 
         def make_harness(**kwargs: Any) -> Harness:
+            # tester=False is explicit: the coder checks below write throwaway
+            # files, so they must not inherit --tester from the command line.
+            # The tester fence has its own checks, with tester=True.
             options: dict[str, Any] = {
                 "api_key": "selftest-key",
                 "auto_approve": True,
+                "tester": False,
             }
             options.update(kwargs)
             return Harness(workspace, **options)
@@ -3536,6 +3798,111 @@ def run_selftest() -> int:
             expect_error(lambda: harness.tool_delete_file("."), "workspace root")
 
         check("delete_file guards non-empty dirs and the workspace root", _delete_guards)
+
+        # -- the tester fence ------------------------------------------------
+        # In tester mode the only writable path is the testing report, so the
+        # write tools have to refuse everything else. These checks build their
+        # own harness with tester=True; the ones above stay in coder mode.
+        def _report_only_writes() -> None:
+            tester = make_harness(tester=True)
+            for attempt in (
+                lambda: tester.tool_write_file("app.py", "print(1)\n"),
+                lambda: tester.tool_edit_file("app.py", "a", "b"),
+                lambda: tester.tool_append_file("notes.md", "x"),
+            ):
+                try:
+                    attempt()
+                except ToolError as exc:
+                    assert "only file it may write" in str(exc), str(exc)
+                else:
+                    raise AssertionError("a source write was allowed in tester mode")
+            assert not (workspace / "app.py").exists(), "a refused write still created a file"
+
+            # dispatch() turns the refusal into an "ERROR:" result, so it has to
+            # be checked as text rather than by catching.
+            if "only file it may write" not in tester.dispatch(
+                "write_file", {"filename": "src/app.py", "content": "x"}
+            ):
+                raise AssertionError("dispatch allowed a source write in tester mode")
+
+            expect_error(
+                lambda: tester.tool_delete_file(REPORT_PATH.as_posix()),
+                "nothing is deleted",
+            )
+
+            wrote = tester.dispatch(
+                "write_file",
+                {"filename": REPORT_PATH.as_posix(), "content": "# handover\n"},
+            )
+            assert "Created" in wrote, wrote
+            assert tester.report_path.read_text() == "# handover\n", wrote
+
+            appended = tester.dispatch(
+                "append_file",
+                {"filename": REPORT_PATH.as_posix(), "content": "entry\n"},
+            )
+            assert "Appended" in appended, appended
+            assert tester.report_path.read_text() == "# handover\nentry\n"
+
+            # A crash-named delete in a resumed conversation still gets the
+            # tester answer, not "unknown tool".
+            assert "nothing is deleted" in tester.dispatch(
+                "delete_file", {"filename": "app.py"}
+            )
+
+        check("tester mode writes only .harness_sessions/Testing.md", _report_only_writes)
+
+        def _tester_tool_menu() -> None:
+            coder_names = [tool["function"]["name"] for tool in tools_for(False)]
+            tester_names = [tool["function"]["name"] for tool in tools_for(True)]
+            assert coder_names == [tool["function"]["name"] for tool in TOOLS]
+            assert "delete_file" in coder_names, coder_names
+            assert "delete_file" not in tester_names, tester_names
+            assert len(tester_names) == len(coder_names) - 1, tester_names
+            for expected in ("list_files", "search_files", "read_file",
+                             "write_file", "append_file", "execute_command"):
+                assert expected in tester_names, tester_names
+            # The coder descriptions must survive the copy untouched.
+            coder_write = next(t for t in tools_for(False)
+                               if t["function"]["name"] == "write_file")
+            assert "Create a new file" in coder_write["function"]["description"]
+            tester_write = next(t for t in tools_for(True)
+                                if t["function"]["name"] == "write_file")
+            assert "testing report" in tester_write["function"]["description"]
+
+        check("the tester tool menu drops delete_file and rewrites the descriptions",
+              _tester_tool_menu)
+
+        def _tester_prompt_and_harness() -> None:
+            tester = make_harness(tester=True)
+            coder = make_harness(tester=False)
+            assert "software tester" in tester.system_prompt(), tester.system_prompt()[:200]
+            assert "coding assistant" in coder.system_prompt(), coder.system_prompt()[:200]
+            assert "coding assistant" not in tester.system_prompt()
+            assert tester.code_read_only and not coder.code_read_only
+            assert tester.tester and not coder.tester
+            assert "U · T E S T E R" in banner(None, tester=True) or \
+                   "U - T E S T E R" in banner(None, tester=True)
+            assert "U · H A R N E S S" in banner(None) or \
+                   "U - H A R N E S S" in banner(None)
+            assert "U-TESTER" not in banner(None)
+            approve = dict(commands_for(True))
+            assert "report writes" in approve["/approve [on|off]"], approve
+            assert "write/edit/delete/execute" in dict(commands_for(False))["/approve [on|off]"]
+
+        check("--tester switches the prompt, the logo and the harness fence",
+              _tester_prompt_and_harness)
+
+        def _tester_flag_is_seen_by_help() -> None:
+            assert tester_requested(["--tester", "go"])
+            assert tester_requested(["--test", "go"])       # argparse abbreviation
+            assert not tester_requested(["go", "--yes"])
+            assert not tester_requested([])
+            assert "--tester" in build_parser(True).format_help()
+            assert "U-TESTER" in build_parser(True).format_help()
+            assert "U-HARNESS" in build_parser(False).format_help()
+
+        check("--tester is parsed and changes the help text", _tester_flag_is_seen_by_help)
 
         # -- dry run --------------------------------------------------------
         def _dry_run() -> None:
@@ -4485,7 +4852,13 @@ def run_selftest() -> int:
         def fresh_undo(room: str, **kwargs: Any) -> Harness:
             path = undo_root_dir / room
             path.mkdir(exist_ok=True)
-            options: dict[str, Any] = {"api_key": "selftest-key", "auto_approve": True}
+            # tester=False: undo checks write throwaway files, so they must not
+            # inherit --tester from the command line.
+            options: dict[str, Any] = {
+                "api_key": "selftest-key",
+                "auto_approve": True,
+                "tester": False,
+            }
             options.update(kwargs)
             return Harness(path, **options)
 
@@ -4645,16 +5018,66 @@ def run_selftest() -> int:
 # CLI
 # --------------------------------------------------------------------------- #
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
+def tester_requested(argv: list[str]) -> bool:
+    """True if --tester (or an unambiguous abbreviation) is on the command line.
+
+    --help has to describe the mode the user asked for, but argparse only knows
+    about --tester after it has parsed. A throwaway parser answers the question
+    first, using argparse's own abbreviation rules, and ignores everything it
+    does not recognise.
+    """
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--tester", action="store_true")
+    try:
+        known, _unknown = probe.parse_known_args(argv)
+    except SystemExit:      # e.g. an ambiguous abbreviation: the real parser
+        return False        # will report it properly
+    return bool(known.tester)
+
+
+def build_parser(tester: bool = False) -> argparse.ArgumentParser:
+    """The CLI. `tester` only chooses which help text is printed."""
+    if tester:
+        description = (
+            "Tester agent: reads a handover, checks the code, runs the tests\n"
+            "and reports defects in .harness_sessions/Testing.md. It never\n"
+            "changes the code under test.\n"
+            "Run without --tester for the coder half of the same loop."
+        )
+        examples = (
+            '  python3 uharness.py --tester --yes "test the handover in .harness_sessions/Testing.md"\n'
+            '  python3 uharness.py --tester --yes "verify round 2 and report the defects"\n'
+            '  python3 uharness.py --tester --dry-run "check src/importer.py and run its tests"\n'
+            '  python3 uharness.py --tester --verbosity full "run the tests and show the output"\n'
+            '  python3 uharness.py --tester "@{handover to tester} review the last changes"\n'
+            '  python3 uharness.py --selftest     # verify tools offline\n'
+            "  python3 uharness.py --tester       # interactive\n"
+            "\n"
+            "Tester rule: the only writable file is .harness_sessions/Testing.md.\n"
+            "The write tools refuse every other path and delete_file is not\n"
+            "offered, so a run can never change the code it is reviewing.\n"
+        )
+        approve_help = (
+            "  /approve [on|off]   toggle asking before writing the report or\n"
+            "                      running a command (or answer 'always' at an\n"
+            "                      allow? prompt)\n"
+        )
+        yes_help = (
+            "auto-approve report writes and command execution (does not lift "
+            "the tester fence - only .harness_sessions/Testing.md is writable - "
+            "and does not lift the dangerous-command blocklist, which needs "
+            "--allow-dangerous)"
+        )
+        banner_help = "start quietly, without the U-TESTER text-art logo"
+    else:
+        description = (
             "Agent harness: let an LLM read, edit and run files for you.\n"
             "Free by default on DeepSeek's deepseek-v4.1-flash:free via Token\n"
-            "Harbor; /model paid switches to DeepSeek's own endpoint."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
+            "Harbor; /model paid switches to DeepSeek's own endpoint.\n"
+            "--tester runs the same tool layer as the tester half of the\n"
+            "two-agent development loop."
+        )
+        examples = (
             '  python3 uharness.py "Create hello.py that prints hello"\n'
             '  python3 uharness.py --yes "Read data.csv and write report.md"\n'
             '  python3 uharness.py --dry-run "Rename things in utils.py"\n'
@@ -4662,15 +5085,31 @@ def build_parser() -> argparse.ArgumentParser:
             '  python3 uharness.py "@{test} inventory the docs/ folder"\n'
             '  python3 uharness.py --selftest     # verify tools offline\n'
             "  python3 uharness.py                # interactive\n"
-            "\n"
+        )
+        approve_help = (
+            "  /approve [on|off]   toggle asking before write/edit/delete/execute\n"
+            "                      (or answer 'always' at an allow? prompt)\n"
+        )
+        yes_help = (
+            "auto-approve file writes, edits, deletes and command execution "
+            "(does not lift the dangerous-command blocklist - that needs "
+            "--allow-dangerous)"
+        )
+        banner_help = "start quietly, without the U-HARNESS text-art logo"
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            + examples
+            + "\n"
             "Interactive commands (blank arguments are shown as [name];\n"
             "/help inside a session prints the same list):\n"
             "  /save [name]        save the conversation to .harness_sessions/\n"
             "  /open [name]        pick a saved conversation and continue it\n"
             "  /sessions           list saved conversations\n"
             "  /skills             list skill names\n"
-            "  /approve [on|off]   toggle asking before write/edit/delete/execute\n"
-            "                      (or answer 'always' at an allow? prompt)\n"
+            + approve_help +
             "  /model [free|paid]  show the model in use, or switch tier\n"
             "  /context            show how much context the conversation uses\n"
             "  /verbose [level]    quiet, brief or full - how much result text prints\n"
@@ -4700,12 +5139,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="*", help="what you want the agent to do")
     parser.add_argument("-i", "--interactive", action="store_true", help="keep asking for prompts")
     parser.add_argument(
-        "-y", "--yes", action="store_true",
+        "--tester", action="store_true",
         help=(
-            "auto-approve file writes, edits, deletes and command execution "
-            "(does not lift the dangerous-command blocklist - that needs "
-            "--allow-dangerous)"
+            "run as the tester half of the two-agent loop: read "
+            f"{REPORT_PATH.as_posix()}, test the work it describes and report "
+            "defects there. The write tools accept that one path only - the "
+            "code under test is read-only - and delete_file is not offered"
         ),
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true",
+        help=yes_help,
     )
     parser.add_argument(
         "--allow-dangerous", action="store_true",
@@ -4776,7 +5220,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--no-banner", action="store_true",
-        help="start quietly, without the U-HARNESS text-art logo",
+        help=banner_help,
     )
     parser.add_argument(
         "--log", default=None,
@@ -4801,9 +5245,20 @@ COMMANDS: list[tuple[str, str]] = [
 ]
 
 
-def show_commands() -> None:
+def commands_for(tester: bool = False) -> list[tuple[str, str]]:
+    """/help rows. Only the /approve line differs between the two modes."""
+    if not tester:
+        return COMMANDS
+    return [
+        (command, "ask before report writes and commands (alias /auto)"
+         if command.startswith("/approve") else description)
+        for command, description in COMMANDS
+    ]
+
+
+def show_commands(tester: bool = False) -> None:
     print()
-    print(panel("commands", COMMANDS))
+    print(panel("commands", commands_for(tester)))
     print(paint("  unknown commands are warned about, never sent to the model",
                 "dim"))
 
@@ -5009,7 +5464,7 @@ def interactive_loop(harness: Harness) -> None:
                 autosave_on_exit(harness)
                 return
             if word in {"/help", "/?"}:
-                show_commands()
+                show_commands(harness.tester)
                 continue
             if word in {"/approve", "/auto"}:
                 if argument not in {"", "on", "off", "toggle"}:
@@ -5119,8 +5574,14 @@ def interactive_loop(harness: Harness) -> None:
 
 
 def main() -> int:
-    parser = build_parser()
+    global TESTER
+
+    parser = build_parser(tester_requested(sys.argv[1:]))
     args = parser.parse_args()
+
+    # Set the mode before anything else, so the selftest, the banner, the
+    # system prompt and the tool menu all agree on which job this run is doing.
+    TESTER = bool(args.tester)
 
     if args.selftest:
         return run_selftest()
@@ -5157,18 +5618,26 @@ def main() -> int:
         log_path=Path(args.log).expanduser() if args.log else None,
         show_usage=args.usage,
         autosave=not args.no_autosave,
+        tester=args.tester,
     )
 
     rows: list[tuple[str, str]] = [
         ("model", harness.model),
         ("profile", "free" if harness.free else "paid"),
         ("workspace", str(harness.workspace)),
-        ("tools", f"{len(TOOLS)} available"),
+        ("tools", f"{len(harness.tools)} available"),
     ]
+    if harness.tester:
+        rows.append(("role", f"tester (writes only {REPORT_PATH.as_posix()})"))
     if args.dry_run:
         rows.append(("mode", "dry run (nothing will be changed)"))
+    elif harness.tester:
+        approval = ("auto (--yes)" if args.yes
+                    else "ask before report writes and commands")
+        rows.append(("approval", approval))
     else:
-        approval = "auto (--yes)" if args.yes else "ask before write/edit/delete/execute"
+        approval = ("auto (--yes)" if args.yes
+                    else "ask before write/edit/delete/execute")
         rows.append(("approval", approval))
     if harness.autosave:
         rows.append(("autosave", f"after every turn to {SESSION_DIR_NAME}/"))
@@ -5178,7 +5647,7 @@ def main() -> int:
             print(f"{label + ':':<10} {value}")
     else:
         print()
-        print(banner())
+        print(banner(tester=harness.tester))
         print()
         print(panel("session", rows))
     print()
