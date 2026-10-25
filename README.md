@@ -70,6 +70,7 @@ See [Getting an API key](#getting-an-api-key) for the details, or
 - [Approval and safety](#approval-and-safety)
 - [Interactive mode](#interactive-mode)
 - [Desktop window](#desktop-window)
+- [Desktop launcher (Fedora / GNOME)](#desktop-launcher-fedora--gnome)
 - [Skills](#skills)
 - [Environment variables](#environment-variables)
 - [How it works](#how-it-works)
@@ -221,6 +222,75 @@ python3 /path/to/uharness.py --workspace ~/myproject "..."
 If you would rather have a window than a prompt, `uharness-ui.py` beside it is
 the same agent with a tkinter front-end — see [Desktop window](#desktop-window).
 It needs `python3-tk`, which the terminal version does not.
+
+---
+
+## Desktop launcher (Fedora / GNOME)
+
+`uharness-ui` is the command behind the desktop icon, and it is the same agent
+with a window: prompt on top, feedback below, every slash command in the menu
+bar. Fedora can launch it from the application grid:
+
+```bash
+./install-launcher.sh              # install
+./install-launcher.sh --uninstall  # remove
+```
+
+That creates three things, all under `$HOME`, so no `sudo` is needed:
+
+| Path | What it is |
+|------|------------|
+| `~/.local/bin/uharness-ui` | Symlink to `uharness-ui-launcher` (the command) |
+| `~/.local/share/applications/uharness-ui.desktop` | The application-grid entry |
+| `~/.local/share/icons/hicolor/scalable/apps/uharness-ui.svg` | The icon |
+
+Re-running the installer is safe: the command is a *symlink* into this repo, so
+edits here take effect immediately and only the icon and `.desktop` file are
+copied. `desktop-file-validate` runs automatically when installed
+(`sudo dnf install desktop-file-utils` to get it).
+
+**Which folder it opens on.** A window started from the application grid
+inherits the home directory as its working directory, which would silently make
+your entire `$HOME` the agent's workspace. The launcher avoids that: it uses
+`$UHARNESS_WORKSPACE` if set, otherwise the first of `~/Projects`, `~/projects`,
+`~/repos`, `~/src`, `~/code` or `~/workspace` that exists, and only falls back
+to `$HOME` as a last resort. An explicit `--workspace` always wins, and
+*Conversation > Change workspace…* moves the window somewhere else without
+restarting it.
+
+**Fedora dependencies.** The window needs tkinter, which Fedora ships
+separately:
+
+```bash
+sudo dnf install python3-tkinter
+python3 -m pip install openai
+```
+
+The launcher pre-flights both before starting and names the missing package in
+a dialog, so a grid launch cannot fail silently. Launched from a terminal it
+prints the error there instead, and from the grid the details also land in
+`~/.local/state/uharness-ui/launcher.log`.
+
+**From the command line**, the same launcher takes every `uharness-ui.py`
+option:
+
+```bash
+uharness-ui                             # window on the default workspace
+uharness-ui --workspace ~/project        # ... on a folder you pick
+uharness-ui "Summarise README.md"        # ask straight away
+uharness-ui --verbosity full --usage     # same flags as the terminal agent
+uharness-ui --help
+```
+
+In the window: Enter sends, Shift+Enter adds a line, Ctrl+↑/↓ walks the prompt
+history, Ctrl+S saves the conversation, Ctrl+O opens one, Ctrl+Shift+Z undoes
+the last request's file changes, Ctrl+L clears the feedback pane and Ctrl+Q
+quits. The terminal "allow?" prompt becomes a dialog
+with *Allow once*, *Deny* and *Always allow* - the dangerous-command blocklist,
+`--dry-run` and auto-approval all still apply. The UI imports `uharness.py`
+rather than copying it, so the tools, skills, saved sessions, autosave and
+context compaction are exactly the terminal version's; the terminal version
+does not need the UI at all.
 
 ---
 
@@ -481,6 +551,7 @@ request, Ctrl+D (or `/exit`) leaves.
 | `/context` | Show how much context the conversation is using. Alias: `/ctx`. |
 | `/verbose [full\|brief\|quiet]` | How much of each tool result is printed. Blank prints the level in force. Alias: `/verbosity`. |
 | `/reset` | Forget the current conversation, keep the session alive. |
+| `/undo [list]` | Put back the files the last request changed. A snapshot is taken automatically before every write, edit, append and delete; `list` shows what is still undoable. |
 | `/help` | Show the command panel, aliases included. Alias: `/?`. |
 | `/exit` | Leave. Aliases: `/quit`; typing `exit` or `quit` (no slash) also works. |
 
@@ -892,7 +963,11 @@ need to observe a non-interactive denial.
 ```
 uharness                  Launcher script. Runs the agent in your cwd.
 uharness.py               The entire agent. Single file, ~4,500 lines.
-uharness-ui.py            Optional tkinter window around the same agent.
+uharness-ui.py            tkinter front-end: same agent, in a window.
+uharness-ui-launcher      Shell launcher behind the desktop icon / PATH command.
+uharness-ui.desktop       Application-grid entry (template; see the installer).
+uharness-ui.svg           The icon, scalable.
+install-launcher.sh       Installs the three above under ~/.local (and removes).
 skills/                   Skill packs, searched from every workspace.
 ├── always-be-funny/
 │   └── SKILL.md          Example skill.

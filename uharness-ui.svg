@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- U-HARNESS UI application icon: the block "U" from the terminal banner,
+     carrying a harness strap, on the window's own background colour. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"
+     viewBox="0 0 256 256" role="img" aria-label="U-HARNESS UI">
+  <title>U-HARNESS UI</title>
+
+  <!-- window-coloured rounded tile -->
+  <rect x="0" y="0" width="256" height="256" rx="52" fill="#15171b"/>
+  <rect x="1.5" y="1.5" width="253" height="253" rx="50.5" fill="none"
+        stroke="#3d6399" stroke-width="3" opacity="0.55"/>
+
+  <!-- the U -->
+  <path d="M78 66 V138 A50 50 0 0 0 178 138 V66"
+        fill="none" stroke="#66c9df" stroke-width="24"
+        stroke-linecap="square" stroke-linejoin="miter"/>
+
+  <!-- harness straps across the arms -->
+  <path d="M66 104 H90" stroke="#7ddc7d" stroke-width="10" stroke-linecap="round"/>
+  <path d="M166 104 H190" stroke="#7ddc7d" stroke-width="10" stroke-linecap="round"/>
+
+  <!-- the buckle that the strap runs through -->
+  <circle cx="128" cy="188" r="11" fill="none" stroke="#e8c547" stroke-width="7"/>
+</svg>

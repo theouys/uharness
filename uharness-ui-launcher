@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Launch U-HARNESS UI - the tkinter front-end of the agent.
+#
+# This is the command line behind the Fedora application-grid icon, and it
+# works by hand too:
+#
+#     uharness-ui                          # window opens on the default workspace
+#     uharness-ui --workspace ~/project    # window opens on that directory
+#     uharness-ui "Summarise README.md"    # ask straight away
+#     uharness-ui --help                   # every uharness.py option
+#
+# Arguments are forwarded to uharness-ui.py verbatim - no filtering, no
+# reordering, no quoting games - so anything that works with the python script
+# works here.
+set -euo pipefail
+
+# Resolve this script's own directory, following symlinks, because the
+# installer links it into ~/.local/bin and the agent still lives in the repo.
+source="${BASH_SOURCE[0]}"
+while [ -L "$source" ]; do
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  source="$(readlink "$source")"
+  [[ "$source" != /* ]] && source="$dir/$source"
+done
+here="$(cd -P "$(dirname "$source")" && pwd)"
+
+app="$here/uharness-ui.py"
+log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uharness-ui"
+log="$log_dir/launcher.log"
+
+mkdir -p "$log_dir" 2>/dev/null || true
+
+# A menu launcher has no terminal, so a missing dependency would otherwise do
+# nothing at all. Report it the loudest way available and log it for the rest.
+# A GUI helper is only used when there is a display: over SSH or from a cron
+# job, zenity would block for ever on a dialog nobody can see.
+fail() {
+  local message="$1"
+  local display="${DISPLAY:-}${WAYLAND_DISPLAY:-}"
+  {
+    printf '%s uharness-ui: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$message"
+  } >>"$log" 2>/dev/null || true
+  if [ -n "$display" ]; then
+    if command -v zenity >/dev/null 2>&1; then
+      zenity --error --title="U-HARNESS UI" --no-wrap --text="$message" 2>/dev/null || true
+    elif command -v kdialog >/dev/null 2>&1; then
+      kdialog --title "U-HARNESS UI" --error "$message" 2>/dev/null || true
+    elif command -v notify-send >/dev/null 2>&1; then
+      notify-send "U-HARNESS UI" "$message" 2>/dev/null || true
+    elif command -v xmessage >/dev/null 2>&1; then
+      xmessage -center "U-HARNESS UI: $message" 2>/dev/null || true
+    fi
+  fi
+  # Always keep the message on stderr as well: launched from a terminal, that
+  # is where the user is actually looking.
+  printf 'uharness-ui: %s\n' "$message" >&2
+  exit 127
+}
+
+if [ ! -f "$app" ]; then
+  fail "cannot find uharness-ui.py beside $here/"
+fi
+
+# Pick the interpreter. UHARNESS_PYTHON wins so a specific build can be used;
+# otherwise prefer python3 and fall back to a bare `python`.
+if [ -n "${UHARNESS_PYTHON:-}" ]; then
+  py="$UHARNESS_PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+  py=python3
+elif command -v python >/dev/null 2>&1; then
+  py=python
+else
+  fail "python3 not found on PATH - on Fedora: sudo dnf install python3"
+fi
+
+# Pre-flight the two imports the window cannot start without. Doing it here,
+# rather than inside the window, means the user gets a sentence naming the
+# package to install instead of a silent nothing.
+"$py" -c 'import tkinter' >/dev/null 2>&1 \
+  || fail "tkinter is missing - on Fedora: sudo dnf install python3-tkinter"
+"$py" -c 'import openai' >/dev/null 2>&1 \
+  || fail "the openai package is missing - install it with: $py -m pip install openai"
+
+# A GUI launched from the application grid inherits cwd=$HOME, which would make
+# the agent's default workspace the whole home directory. Pick a project folder
+# instead: UHARNESS_WORKSPACE first, then the first of these that exists, and
+# $HOME only as a last resort (the window says so, and Conversation > Change
+# workspace moves it).
+if [ "${UHARNESS_WORKSPACE:-}" ]; then
+  workspace="$UHARNESS_WORKSPACE"
+else
+  workspace=""
+  for candidate in "$HOME/Projects" "$HOME/projects" "$HOME/repos" \
+                   "$HOME/src" "$HOME/code" "$HOME/workspace"; do
+    if [ -d "$candidate" ]; then
+      workspace="$candidate"
+      break
+    fi
+  done
+  [ -n "$workspace" ] || workspace="$HOME"
+fi
+
+# Only supply the workspace when the caller did not: an explicit --workspace or
+# -w on the command line always wins.
+has_workspace=0
+for argument in "$@"; do
+  case "$argument" in
+    -w|--workspace|--workspace=*|-w*) has_workspace=1; break ;;
+    --) break ;;
+  esac
+done
+
+# A terminal keeps its stderr, so a traceback is readable where it happens; from
+# the application grid there is no terminal, so the log file is the only trace
+# a crash leaves behind.
+launch() {
+  if [ -t 2 ]; then
+    exec "$py" "$app" "$@"
+  fi
+  exec "$py" "$app" "$@" 2>>"$log"
+}
+
+if [ "$has_workspace" -eq 1 ]; then
+  launch "$@"
+fi
+cd "$workspace" 2>/dev/null || cd "$HOME"
+launch --workspace "$workspace" "$@"

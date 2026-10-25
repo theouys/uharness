@@ -795,8 +795,75 @@ def tier_badge(harness: Harness, stream: Any = None) -> str:
     )
 
 
+def _split_at(text: str, budget: int) -> tuple[str, str]:
+    """Peel off the longest head of `text` that fits in `budget` columns.
+
+    Prefers the last space inside the head, so words stay whole; falls back to
+    a hard cut only when the budget falls inside a single very long token.
+    Wide (CJK) characters count double and combining marks ride along with
+    the character they belong to, matching display_width().
+    """
+    width = 0
+    cut = 0
+    for index, char in enumerate(text):
+        if unicodedata.combining(char):
+            continue                     # no width of its own
+        step = 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        if width + step > budget:
+            break
+        width += step
+        cut = index + 1
+    else:
+        return text, ""                  # the whole thing fits
+    if cut == 0:                         # one character already too wide
+        return text[:1], text[1:]
+    head = text[:cut]
+    space = head.rfind(" ")
+    if space > 0:                        # break on the word boundary
+        word_break = head[:space].rstrip(" ")
+        if word_break:                   # (a head of pure spaces keeps its cut)
+            return word_break, text[space + 1:]
+    return head, text[cut:]
+
+
+def _fold_line(line: str, limit: int) -> list[str]:
+    """Split one line into pieces that each fit in `limit` terminal columns.
+
+    Continuation pieces repeat the line's own indentation, so a nested list
+    keeps its shape once folded. A line carrying an escape sequence is left
+    alone: splitting it could cut a colour code in half.
+    """
+    if limit <= 0 or "\x1b" in line or display_width(line) <= limit:
+        return [line]
+    indent = line[: len(line) - len(line.lstrip(" "))]
+    if display_width(indent) * 2 >= limit:   # a deeper indent would leave no room
+        indent = ""
+    pieces: list[str] = []
+    lead = ""                                # the first row keeps the line's own
+    rest = line
+    while rest:
+        budget = limit - display_width(lead)
+        if display_width(rest) <= budget:
+            pieces.append(lead + rest)
+            break
+        head, tail = _split_at(rest, budget)
+        if not head:
+            pieces.append(lead + rest)
+            break
+        pieces.append(lead + head)
+        rest, lead = tail, indent
+    return pieces or [""]
+
+
 def assistant_block(text: str, stream: Any = None) -> str:
-    """The model's prose in a coloured left-bordered block."""
+    """The model's prose in a coloured left-bordered block.
+
+    Long lines are folded here instead of being left to the terminal. The
+    terminal wraps at the right margin without knowing about the "│ " rail,
+    so every wrapped row but the first lost its left edge; folding beforehand
+    means each row of the block carries the bar and the whole block keeps its
+    outline at any width.
+    """
     g = glyphs(stream)
     bar = paint(g["v"], "grey", stream=stream)
     head = (
@@ -804,10 +871,19 @@ def assistant_block(text: str, stream: Any = None) -> str:
         + paint("assistant", "bold", "green", stream=stream)
     )
     lines = text.strip().splitlines() or [""]
-    body = [
-        f"{RESULT_INDENT}{bar} {line}" if line.strip() else f"{RESULT_INDENT}{bar}"
-        for line in lines
-    ]
+    # One column for the bar, one for the space after it, plus the indent.
+    gutter = display_width(RESULT_INDENT) + display_width(g["v"]) + 1
+    limit = max(16, term_width() - gutter - 1)      # -1: never end on the margin
+    body: list[str] = []
+    for line in lines:
+        # Tabs move to the terminal's own 8-column stops before measuring, so
+        # the fold lands where the screen actually wraps. Nothing else is
+        # rewritten: the line still reads as the model wrote it.
+        for piece in _fold_line(line.expandtabs(8), limit):
+            piece = piece.rstrip()
+            body.append(
+                f"{RESULT_INDENT}{bar} {piece}" if piece else f"{RESULT_INDENT}{bar}"
+            )
     return "\n".join([head, *body])
 
 
@@ -1794,6 +1870,11 @@ class Harness:
         self.usage: dict[str, int] = {}
         self.api_calls = 0
         self._compaction_noted = False
+        # Undo: every turn opens one snapshot group, and the modifying tools
+        # record what a path looked like before they touch it. The group is
+        # created lazily, so a turn that changes nothing leaves no directory.
+        self._undo_group: Path | None = None
+        self._undo_warned = False
         # Which profile the client is currently built from ("free" or "paid").
         self.api_key = api_key
         self.free = self._infer_free()
@@ -2310,6 +2391,7 @@ class Harness:
         if not self._approve("Edit file", f"{self.rel(path)}: {preview}"):
             raise ToolError(f"user denied permission to edit '{filename}'")
 
+        self._snapshot(path)
         output = after.replace("\n", "\r\n") if uses_crlf else after
         try:
             with path.open("w", encoding="utf-8", newline="") as handle:
@@ -2333,6 +2415,7 @@ class Harness:
             return f"DRY RUN: would {action.lower()} {self.rel(path)} ({len(content)} characters)"
         if not self._approve(f"{action} file", self.rel(path)):
             raise ToolError(f"user denied permission to write '{filename}'")
+        self._snapshot(path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
@@ -2348,6 +2431,7 @@ class Harness:
             return f"DRY RUN: would append {len(content)} characters to {self.rel(path)}"
         if not self._approve("Append to file", self.rel(path)):
             raise ToolError(f"user denied permission to append to '{filename}'")
+        self._snapshot(path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
@@ -2382,6 +2466,7 @@ class Harness:
         if not self._approve("Delete", label):
             raise ToolError(f"user denied permission to delete '{filename}'")
 
+        self._snapshot(path)
         try:
             if is_dir:
                 shutil.rmtree(path)
@@ -2729,6 +2814,8 @@ class Harness:
         # so the skill text sits *before* the request that asked for it. This
         # also refreshes the system prompt, so a skill added to disk since
         # startup appears in the index straight away.
+        # One /undo reverts one request, so each turn starts a fresh group.
+        self._undo_group = None
         self.refresh_system_prompt()
         self.load_skills(user_message)
 
@@ -3001,6 +3088,205 @@ class Harness:
                        stream=sys.stderr),
                 file=sys.stderr,
             )
+
+    # -- undo --------------------------------------------------------------- #
+    #
+    # The writing tools are destructive by design: write_file replaces a whole
+    # file, delete_file can remove a tree, and edit_file is a blind string
+    # substitution. Before any of them touches a path, _snapshot() copies what
+    # is there into .harness_sessions/undo/<stamp>/ and records it in that
+    # group's manifest. /undo then puts the last request's changes back.
+    #
+    # One group per request, not per tool call: an agent turn is the unit a
+    # human thinks in ("undo what it just did"), and a ten-call refactor should
+    # be one undo away, not ten. A file touched twice in one turn is snapshotted
+    # once - the state that matters is the one from before the turn started.
+
+    UNDO_DIR_NAME = "undo"
+    UNDO_KEEP = 10            # snapshot groups kept; older ones are pruned
+
+    def undo_root(self) -> Path:
+        """Where snapshot groups live: inside the workspace, and dot-hidden."""
+        return self.sessions_dir / self.UNDO_DIR_NAME
+
+    def _undo_group_path(self) -> Path:
+        """The group for the current turn, created on first use."""
+        if self._undo_group is not None:
+            return self._undo_group
+        root = self.undo_root()
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        candidate = root / stamp
+        suffix = 1
+        # Two turns in the same second must not share a group.
+        while candidate.exists():
+            candidate = root / f"{stamp}-{suffix:03d}"
+            suffix += 1
+        candidate.mkdir()
+        self._undo_group = candidate
+        # Directory names are not creation order: pruning frees names, so a
+        # later turn can reuse an older, alphabetically-earlier one. Record a
+        # monotonic sequence instead and sort by that everywhere.
+        seq = max((self._group_seq(path) for path in self._all_group_dirs()),
+                  default=0) + 1
+        (candidate / "seq").write_text(f"{seq}\n", encoding="utf-8")
+        self._prune_undo_groups()
+        return candidate
+
+    def _all_group_dirs(self) -> list[Path]:
+        root = self.undo_root()
+        if not root.is_dir():
+            return []
+        return [path for path in root.iterdir() if path.is_dir()]
+
+    @staticmethod
+    def _group_seq(group: Path) -> int:
+        """A group's creation order; 0 for anything written without one."""
+        try:
+            return int((group / "seq").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0
+
+    def _prune_undo_groups(self) -> None:
+        """Keep the newest UNDO_KEEP groups, drop the rest."""
+        groups = sorted(self._all_group_dirs(),
+                        key=lambda path: (self._group_seq(path), path.name))
+        for old in groups[:max(0, len(groups) - self.UNDO_KEEP)]:
+            if old == self._undo_group:
+                continue           # never prune the group this turn is writing
+            try:
+                shutil.rmtree(old)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _read_manifest(group: Path) -> list[dict[str, Any]]:
+        """The entries recorded in one group, oldest first."""
+        try:
+            data = json.loads((group / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        entries = data.get("entries") if isinstance(data, dict) else None
+        return [entry for entry in entries or [] if isinstance(entry, dict)]
+
+    def _snapshot(self, path: Path) -> None:
+        """Remember `path` as it is now, before a tool changes it.
+
+        Called after approval and before the write, so a denied or failed tool
+        call records nothing. A path that does not exist yet is recorded as
+        kind "none", which is what lets /undo delete a file the agent created.
+        """
+        if self.dry_run:           # nothing will change, so nothing to undo
+            return
+        try:
+            group = self._undo_group_path()
+            entries = self._read_manifest(group)
+            relative = self.rel(path)
+            if any(entry.get("path") == relative for entry in entries):
+                return             # already recorded earlier in this turn
+            index = len(entries) + 1
+            if path.is_dir():
+                backup = group / f"{index:03d}-dir"
+                shutil.copytree(path, backup, symlinks=True)
+                entry = {"path": relative, "kind": "dir", "backup": backup.name}
+            elif path.exists():
+                backup = group / f"{index:03d}-file"
+                shutil.copy2(path, backup)
+                entry = {"path": relative, "kind": "file", "backup": backup.name}
+            else:
+                entry = {"path": relative, "kind": "none", "backup": ""}
+            entries.append(entry)
+            (group / "manifest.json").write_text(
+                json.dumps({"version": 1, "entries": entries}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            # A failed snapshot must never stop the edit the user approved;
+            # it only means this turn cannot be undone.
+            if not self._undo_warned:
+                self._undo_warned = True
+                print(
+                    notice("warn", f"could not record an undo snapshot: {exc} "
+                                   "(the change will not be reversible)",
+                           stream=sys.stderr),
+                    file=sys.stderr,
+                )
+
+    def undo_groups(self) -> list[dict[str, Any]]:
+        """Recorded groups, oldest first (by sequence, not by name)."""
+        found: list[dict[str, Any]] = []
+        for group in sorted(self._all_group_dirs(),
+                            key=lambda path: (self._group_seq(path), path.name)):
+            entries = self._read_manifest(group)
+            if entries:
+                found.append({"name": group.name, "path": group,
+                              "seq": self._group_seq(group),
+                              "entries": len(entries)})
+        return found
+
+    def undo_last(self) -> dict[str, Any]:
+        """Put back the files the last request changed.
+
+        Entries are restored in reverse order, so a turn that deleted a
+        directory and then recreated one of its files ends up consistent.
+        The group is only removed once every entry restored cleanly - a partial
+        failure leaves the snapshots on disk to try again.
+        """
+        if self.dry_run:
+            raise ValueError("dry run is on, so nothing has been changed to undo")
+        groups = self.undo_groups()
+        if not groups:
+            raise ValueError(
+                "nothing to undo - no file changes have been recorded in this "
+                f"workspace ({self.rel(self.undo_root())}/)"
+            )
+        group = groups[-1]["path"]
+        entries = self._read_manifest(group)
+
+        restored: list[str] = []
+        problems: list[str] = []
+        for entry in reversed(entries):
+            relative = str(entry.get("path") or "")
+            kind = str(entry.get("kind") or "")
+            try:
+                target = self.resolve_write(relative)
+                if kind == "none":
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    elif target.exists():
+                        target.unlink()
+                    restored.append(f"removed {relative}")
+                elif kind == "dir":
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    elif target.exists():
+                        target.unlink()
+                    shutil.copytree(group / str(entry.get("backup")), target,
+                                    symlinks=True)
+                    restored.append(f"restored {relative}/")
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(group / str(entry.get("backup")), target)
+                    restored.append(f"restored {relative}")
+            except (OSError, ToolError) as exc:
+                problems.append(f"{relative}: {exc}")
+
+        if problems:
+            raise ValueError(
+                "undo only partly worked, so the snapshots were kept:\n  "
+                + "\n  ".join(problems)
+                + ("\nrestored so far: " + ", ".join(restored) if restored else "")
+            )
+
+        try:
+            shutil.rmtree(group)
+        except OSError:
+            pass
+        return {
+            "group": group.name,
+            "restored": restored,
+            "remaining": len(groups) - 1,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -3348,6 +3634,65 @@ def run_selftest() -> int:
             assert "line99" in buf.value(), "buffer kept the wrong end"
 
         check("BoundedBuffer keeps recent output and reports drops", _bounded_buffer)
+
+        # -- assistant block wrapping --------------------------------------
+        def _assistant_block_wraps() -> None:
+            """Every row of the block keeps its left rail, however long the text.
+
+            A long paragraph used to be left to the terminal, which wraps the
+            row without the "│ " prefix: the rail vanished for the rest of the
+            paragraph. The block must now fold its own lines.
+            """
+            probe = "intro\n" + ("alpha beta gamma " * 12) + (
+                "https://example.com/" + "a" * 120
+            ) + "\n\n  indented " + "x" * 120 + "\n" + (" " * 40) + "y" * 90
+            saved = os.environ.get("COLUMNS")
+            os.environ["COLUMNS"] = "60"
+            try:
+                rendered = assistant_block(probe)
+            finally:
+                if saved is None:
+                    os.environ.pop("COLUMNS", None)
+                else:
+                    os.environ["COLUMNS"] = saved
+
+            rows = rendered.splitlines()[1:]        # skip the "● assistant" heading
+            assert len(rows) > 4, rendered
+            bar = rows[0][len(RESULT_INDENT)]       # "│", or "|" on a dumb stream
+            for row in rows:
+                assert row.startswith(RESULT_INDENT + bar), row
+                assert display_width(row) <= 60, (display_width(row), row)
+            # Folding must not lose or duplicate a single character. Words can
+            # be split (a 140-character URL has to break somewhere), so compare
+            # with the whitespace taken out.
+            folded = "".join(
+                row[len(RESULT_INDENT) + 2:] if len(row) > len(RESULT_INDENT) + 2 else ""
+                for row in rows
+            )
+            assert folded.replace(" ", "") == "".join(probe.split()), folded
+            # The indented line stays indented on its continuation rows.
+            tail = " ".join(
+                row[len(RESULT_INDENT) + 2:] for row in rows
+                if row[len(RESULT_INDENT) + 2:].strip()
+            )
+            assert "indented" in tail and "  indented" in tail, tail
+            # A narrow window folds harder but keeps the rail too.
+            os.environ["COLUMNS"] = "20"
+            try:
+                narrow = assistant_block("the quick brown fox jumps over the lazy dog")
+            finally:
+                if saved is None:
+                    os.environ.pop("COLUMNS", None)
+                else:
+                    os.environ["COLUMNS"] = saved
+            for row in narrow.splitlines()[1:]:
+                assert row.startswith(RESULT_INDENT + bar), row
+                assert display_width(row) <= 44, (display_width(row), row)
+            # Short text is untouched: no gratuitous newlines in one-liners.
+            assert assistant_block("done").splitlines()[1] == f"{RESULT_INDENT}{bar} done"
+
+        check("assistant_block folds long lines and keeps the left rail",
+              _assistant_block_wraps)
 
         # -- line input ------------------------------------------------------
         def _editing_keys() -> None:
@@ -4015,6 +4360,160 @@ def run_selftest() -> int:
 
         check("a workspace without skills/ works normally", _skills_absent_without_the_directory)
 
+        # -- undo -----------------------------------------------------------
+        # Every check gets its own workspace, so one undo cannot reach into
+        # snapshots another check recorded.
+        undo_root_dir = workspace / "undo-rooms"
+        undo_root_dir.mkdir(exist_ok=True)
+
+        def fresh_undo(room: str, **kwargs: Any) -> Harness:
+            path = undo_root_dir / room
+            path.mkdir(exist_ok=True)
+            options: dict[str, Any] = {"api_key": "selftest-key", "auto_approve": True}
+            options.update(kwargs)
+            return Harness(path, **options)
+
+        def _undo_removes_created_file() -> None:
+            local = fresh_undo("created")
+            assert local.undo_root() == local.sessions_dir / "undo", local.undo_root()
+            local.tool_write_file("new.txt", "hello\n")
+            assert (local.workspace / "new.txt").exists()
+            result = local.undo_last()
+            assert result["restored"] == ["removed new.txt"], result
+            assert not (local.workspace / "new.txt").exists(), "undo left the new file"
+            assert local.undo_groups() == [], local.undo_groups()
+
+        check("undo deletes a file the agent created", _undo_removes_created_file)
+
+        def _undo_restores_overwritten_file() -> None:
+            local = fresh_undo("overwritten")
+            local.tool_write_file("keep.txt", "original\n")
+            local._undo_group = None       # this is what _run_turn does per request
+            local.tool_write_file("keep.txt", "changed\n")
+            local.tool_write_file("also.txt", "x\n")
+            local.tool_edit_file("keep.txt", "changed", "changed again")
+            assert (local.workspace / "keep.txt").read_text() == "changed again\n"
+            result = local.undo_last()
+            # Three tool calls in one turn are one group and one undo.
+            assert len(result["restored"]) == 2, result
+            assert (local.workspace / "keep.txt").read_text() == "original\n"
+            assert not (local.workspace / "also.txt").exists()
+            assert result["remaining"] == 1, result
+            local.undo_last()
+            assert not (local.workspace / "keep.txt").exists(), (
+                "the earlier turn should have been undone too"
+            )
+
+        check("undo restores an overwritten file and reverts one turn at a time",
+              _undo_restores_overwritten_file)
+
+        def _undo_restores_deleted_tree() -> None:
+            local = fresh_undo("tree")
+            (local.workspace / "pkg").mkdir()
+            (local.workspace / "pkg" / "a.txt").write_text("a\n")
+            local._undo_group = None
+            local.tool_delete_file("pkg", recursive=True)
+            local.tool_write_file("pkg/a.txt", "recreated\n")
+            local.undo_last()
+            assert (local.workspace / "pkg" / "a.txt").read_text() == "a\n", (
+                "reverse-order restore should put the original tree back"
+            )
+
+        check("undo restores a deleted tree, newest change first",
+              _undo_restores_deleted_tree)
+
+        def _undo_nothing_to_do() -> None:
+            local = fresh_undo("empty")
+            try:
+                local.undo_last()
+            except ValueError as exc:
+                assert "nothing to undo" in str(exc), exc
+            else:
+                raise AssertionError("undo on an empty workspace should refuse")
+
+        check("undo with no recorded changes explains itself", _undo_nothing_to_do)
+
+        def _undo_dry_run_records_nothing() -> None:
+            local = fresh_undo("dry", dry_run=True)
+            local.tool_write_file("dry.txt", "y\n")
+            assert local.undo_groups() == [], "a dry run recorded a snapshot"
+            try:
+                local.undo_last()
+            except ValueError as exc:
+                assert "dry run is on" in str(exc), exc
+            else:
+                raise AssertionError("undo should refuse while dry_run is on")
+
+        check("dry_run records nothing and refuses to undo", _undo_dry_run_records_nothing)
+
+        def _undo_denied_write_records_nothing() -> None:
+            local = fresh_undo("denied", auto_approve=False)
+            out = local.dispatch("write_file", {"filename": "no.txt", "content": "x"})
+            assert out.startswith("ERROR:"), out
+            assert local.undo_groups() == [], "a denied write left a snapshot behind"
+
+        if sys.stdin.isatty():
+            results.append(("approval denial records no snapshot", True,
+                            "skipped (stdin is a TTY)"))
+        else:
+            check("approval denial records no snapshot",
+                  _undo_denied_write_records_nothing)
+
+        def _undo_prunes_old_groups() -> None:
+            local = fresh_undo("prune")
+            local.tool_write_file("f.txt", "0\n")
+            for index in range(local.UNDO_KEEP + 3):
+                local._undo_group = None
+                local.tool_write_file("f.txt", f"{index}\n")
+            groups = local.undo_groups()
+            assert len(groups) == local.UNDO_KEEP, len(groups)
+            assert len(local._all_group_dirs()) == local.UNDO_KEEP, "unpruned dirs on disk"
+            seqs = [group["seq"] for group in groups]
+            assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
+            local.undo_last()
+            # The newest group holds the state from before the newest write.
+            assert (local.workspace / "f.txt").read_text() == f"{local.UNDO_KEEP + 1}\n"
+
+        check(f"only the newest {Harness.UNDO_KEEP} groups are kept",
+              _undo_prunes_old_groups)
+
+        def _undo_keeps_snapshots_on_failure() -> None:
+            local = fresh_undo("partial")
+            local.tool_write_file("p.txt", "old\n")
+            local._undo_group = None
+            local.tool_write_file("p.txt", "new\n")
+            group = local.undo_groups()[-1]["path"]
+            for backup in group.glob("*-file"):
+                backup.unlink()          # a missing backup makes the restore fail
+            try:
+                local.undo_last()
+            except ValueError as exc:
+                assert "partly worked" in str(exc), exc
+            else:
+                raise AssertionError("a broken snapshot must not report success")
+            assert group.is_dir(), "snapshots were dropped after a failed undo"
+            assert (local.workspace / "p.txt").read_text() == "new\n", (
+                "a failed undo must not touch the file"
+            )
+
+        check("a failed undo keeps the snapshots", _undo_keeps_snapshots_on_failure)
+
+        def _undo_list_output() -> None:
+            local = fresh_undo("listing")
+            empty = _capture(lambda: show_undo(local, "list"))
+            assert "nothing recorded" in empty, empty
+            local.tool_write_file("x.txt", "1\n")
+            listed = _capture(lambda: show_undo(local, "list"))
+            assert "change(s)" in listed, listed
+            done = _capture(lambda: show_undo(local))
+            assert "undid" in done and "removed x.txt" in done, done
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                show_undo(local, "sideways")
+            assert "usage" in err.getvalue(), err.getvalue()
+
+        check("/undo list and /undo print the right thing", _undo_list_output)
+
     passed = sum(1 for _name, ok, _detail in results if ok)
     print(f"selftest: {passed}/{len(results)} checks passed")
     for name, ok, detail in results:
@@ -4060,6 +4559,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  /context            show how much context the conversation uses\n"
             "  /verbose [level]    quiet, brief or full - how much result text prints\n"
             "  /reset              forget the current conversation\n"
+            "  /undo [list]        put back the files the last request changed;\n"
+            "                      'list' shows what is recorded\n"
             "  /help               this list\n"
             "  /exit               leave (Ctrl+D and 'exit' work too)\n"
             "Aliases: /? for /help, /ls for /sessions, /skill for /skills,\n"
@@ -4178,6 +4679,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/context", "how much context the conversation uses (alias /ctx)"),
     ("/verbose [level]", "quiet, brief or full (alias /verbosity)"),
     ("/reset", "forget the current conversation"),
+    ("/undo", "put back the files the last request changed (/undo list)"),
     ("/help", "this list (alias /?)"),
     ("/exit", "leave (alias /quit; 'exit' and Ctrl+D too)"),
 ]
@@ -4273,6 +4775,45 @@ def show_sessions(harness: Harness) -> list[dict[str, Any]]:
         preview = fit(item["preview"], max(20, width - 8))
         print("      " + paint(preview, "dim", "italic"))
     return sessions
+
+
+def show_undo(harness: Harness, argument: str = "") -> None:
+    """`/undo` puts the last request's changes back; `/undo list` shows them."""
+    if argument == "list":
+        groups = harness.undo_groups()
+        if not groups:
+            print(notice(
+                "info",
+                f"nothing recorded yet - changes are snapshotted to "
+                f"{harness.rel(harness.undo_root())}/ as they happen",
+                force=True,
+            ))
+            return
+        rows = [
+            (item["name"], f"{item['entries']} change(s)") for item in groups[-10:]
+        ]
+        print()
+        print(panel("undo", rows))
+        print(paint("  /undo puts the newest one back", "dim"))
+        return
+    if argument:
+        print(notice("warn", "usage: /undo - or /undo list to see what is recorded",
+                     stream=sys.stderr), file=sys.stderr)
+        return
+    try:
+        result = harness.undo_last()
+    except ValueError as exc:
+        print(notice("error", str(exc), stream=sys.stderr), file=sys.stderr)
+        return
+    print(notice("ok", f"undid {result['group']}: restored "
+                       f"{len(result['restored'])} path(s)"))
+    for line in result["restored"]:
+        print(paint("  " + line, "dim"))
+    if result["remaining"]:
+        print(paint(f"  {result['remaining']} earlier change(s) still undoable",
+                    "dim"))
+    else:
+        print(paint("  nothing older to undo", "dim"))
 
 
 def choose_session(harness: Harness) -> str | None:
@@ -4393,6 +4934,9 @@ def interactive_loop(harness: Harness) -> None:
             if word == "/reset":
                 harness.reset()
                 print("Conversation cleared.")
+                continue
+            if word == "/undo":
+                show_undo(harness, argument)
                 continue
             if word in {"/sessions", "/ls"}:
                 show_sessions(harness)

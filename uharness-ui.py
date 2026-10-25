@@ -588,6 +588,11 @@ class HarnessUI:
         self.root.configure(menu=menu)
 
         file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Undo last change", accelerator="Ctrl+Shift+Z",
+                              command=lambda: self.command("/undo"))
+        file_menu.add_command(label="Show undo history",
+                              command=lambda: self.command("/undo list"))
+        file_menu.add_separator()
         file_menu.add_command(label="Save conversation\u2026", accelerator="Ctrl+S",
                               command=lambda: self.command("/save"))
         file_menu.add_command(label="Open conversation\u2026", accelerator="Ctrl+O",
@@ -671,6 +676,9 @@ class HarnessUI:
         self.prompt_text.bind("<Control-Up>", self.history_back)
         self.prompt_text.bind("<Control-Down>", self.history_forward)
         root.bind("<Control-s>", lambda _event: (self.command("/save"), "break")[1])
+        # Shift+Z, not plain Ctrl+Z: the prompt box keeps its own text undo.
+        root.bind("<Control-Shift-z>", lambda _event: (self.command("/undo"), "break")[1])
+        root.bind("<Control-Shift-Z>", lambda _event: (self.command("/undo"), "break")[1])
         root.bind("<Control-o>", lambda _event: (self.command("/open"), "break")[1])
         root.bind("<Control-l>", lambda _event: (self.clear_pane(), "break")[1])
         root.bind("<Control-q>", lambda _event: (self.on_close(), "break")[1])
@@ -1020,6 +1028,8 @@ class HarnessUI:
             self.set_verbosity(argument or self.harness.verbosity)
         elif word == "/reset":
             self.reset_conversation()
+        elif word == "/undo":
+            self.undo_last(argument)
         else:
             self.notice("warn", f"unknown command {word} - Help > Commands lists them")
 
@@ -1108,6 +1118,17 @@ class HarnessUI:
             return
         self.harness.reset()
         self.separator("conversation cleared")
+
+    def undo_last(self, argument: str = "") -> None:
+        """Revert the last request's file changes (or list what is recorded).
+
+        The wording, the ordering and the safety rules live in uharness.show_undo
+        and are reused here, so the window and the terminal cannot disagree.
+        """
+        if self.busy:
+            self.notice("warn", "a request is running - stop it before undoing")
+            return
+        core.show_undo(self.harness, argument)
 
     def set_model(self, free: bool) -> None:
         try:
@@ -1362,8 +1383,36 @@ class HarnessUI:
 # Entry point
 # --------------------------------------------------------------------------- #
 
+def fallback_parser() -> Any:
+    """A parser for when uharness.py cannot be imported.
+
+    The real options come from uharness.build_parser(), but that needs the
+    agent. This mirrors the subset a user might type before installing
+    anything, so `--help` explains the situation instead of a traceback.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="uharness-ui",
+        description=(
+            "The U-HARNESS agent in a tkinter window (prompt on top, feedback "
+            "below).\nuharness.py could not be imported, so only this reduced "
+            "option set is available."
+        ),
+    )
+    parser.add_argument("prompt", nargs="*", help="what you want the agent to do")
+    parser.add_argument("-w", "--workspace", default=os.getcwd(),
+                        help="directory the agent may work in")
+    parser.add_argument("--selftest", action="store_true",
+                        help="offline checks of the tool layer")
+    return parser
+
+
 def build_parser() -> Any:
     """The terminal parser, so both front-ends take the same flags."""
+    if core is None:
+        return fallback_parser()
+
     parser = core.build_parser()
     parser.prog = "uharness-ui"
     parser.description = (
@@ -1387,39 +1436,55 @@ def build_parser() -> Any:
     return parser
 
 
-def main() -> int:
-    if core is None:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("U-HARNESS UI", _IMPORT_ERROR or "uharness is missing")
-        root.destroy()
-        return 2
+def report_fatal(title: str, message: str) -> None:
+    """Report a start-up failure, without assuming someone can click OK.
 
+    A modal box is right when the window was launched from the application
+    grid and wrong everywhere else - piped, over SSH, in a test - where it
+    would hang for ever waiting for a click that never comes. A display
+    decides which; the message always reaches stderr as well, which is the
+    launcher's log file when there is no terminal.
+    """
+    print(f"{title}: {message}", file=sys.__stderr__ or sys.stderr)
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return
+    try:
+        root = tk.Tk(className="uharness-ui")
+        root.withdraw()
+        messagebox.showerror(title, message, parent=root)
+        root.destroy()
+    except tk.TclError:  # pragma: no cover - display went away mid-call
+        pass
+
+
+def main() -> int:
+    # Argument parsing comes first: --help and a bad flag must both work even
+    # when the agent cannot be imported, so build_parser() has a fallback.
     args = build_parser().parse_args()
+
+    if core is None:
+        report_fatal("U-HARNESS UI", _IMPORT_ERROR or "uharness.py is missing")
+        return 2
 
     if args.selftest:
         return core.run_selftest()
 
     workspace = Path(args.workspace).expanduser()
     if not workspace.is_dir():
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("U-HARNESS UI",
-                             f"workspace is not a directory:\n{workspace}")
-        root.destroy()
+        report_fatal("U-HARNESS UI", f"workspace is not a directory:\n{workspace}")
         return 2
     args.workspace = str(workspace)
 
-    root = tk.Tk()
+    # className sets WM_CLASS, which is what a desktop shell matches against
+    # StartupWMClass in the .desktop file - without it the window shows the
+    # generic Python icon in the dock instead of U-HARNESS's own.
+    root = tk.Tk(className="uharness-ui")
     try:
         app = HarnessUI(root, args)
     except Exception as exc:            # pragma: no cover - startup failures
-        root.withdraw()
-        messagebox.showerror(
-            "U-HARNESS UI",
-            f"the window could not start:\n\n{type(exc).__name__}: {exc}",
-        )
         root.destroy()
+        report_fatal("U-HARNESS UI",
+                     f"the window could not start:\n\n{type(exc).__name__}: {exc}")
         return 2
 
     root.protocol("WM_DELETE_WINDOW", app.on_close)

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=U-HARNESS UI
+GenericName=AI coding agent
+Comment=Ask an AI agent to read, edit and run files in a workspace
+Exec=@LAUNCHER@
+Icon=uharness-ui
+Terminal=false
+StartupNotify=true
+StartupWMClass=uharness-ui
+Categories=Development;
+Keywords=ai;agent;llm;harness;uharness;deepseek;coding;assistant;
+# Launched from the grid there is no cwd to inherit, so point the file manager
+# at the home directory and let the launcher pick the workspace folder.
+Path=@HOME@
