@@ -518,7 +518,7 @@ bindings added.
 │ /model [free|paid]  show the model in use, or switch tier               │
 │ /context            how much context the conversation uses (alias /ctx) │
 │ /verbose [level]    quiet, brief or full (alias /verbosity)             │
-│ /reset              forget the current conversation                     │
+│ /reset              forget the current conversation (alias /clear)      │
 │ /help               this list (alias /?)                                │
 │ /exit               leave (alias /quit; 'exit' and Ctrl+D too)          │
 ╰─────────────────────────────────────────────────────────────────────────╯
@@ -689,7 +689,7 @@ request, Ctrl+D (or `/exit`) leaves.
 | `/model [free\|paid]` | Show the model in use and the context size, or switch tier. Blank shows it, with the same line that sits above the prompt. |
 | `/context` | Show how much context the conversation is using. Alias: `/ctx`. |
 | `/verbose [full\|brief\|quiet]` | How much of each tool result is printed. Blank prints the level in force. Alias: `/verbosity`. |
-| `/reset` | Forget the current conversation, keep the session alive. |
+| `/reset` | Forget the current conversation, keep the session alive. Alias: `/clear`. |
 | `/undo [list]` | Put back the files the last request changed. A snapshot is taken automatically before every write, edit, append and delete; `list` shows what is still undoable. |
 | `/help` | Show the command panel, aliases included. Alias: `/?`. |
 | `/exit` | Leave. Aliases: `/quit`; typing `exit` or `quit` (no slash) also works. |

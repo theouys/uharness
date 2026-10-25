@@ -1225,7 +1225,7 @@ class HarnessUI:
                 self.notice("warn", "usage: /approve [on|off] - blank toggles")
         elif word in {"/verbose", "/verbosity"}:
             self.set_verbosity(argument or self.harness.verbosity)
-        elif word == "/reset":
+        elif word in {"/reset", "/clear"}:
             self.reset_conversation()
         elif word == "/undo":
             self.undo_last(argument)

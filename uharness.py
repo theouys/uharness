@@ -5857,15 +5857,16 @@ def build_parser(tester: bool = False) -> argparse.ArgumentParser:
             "  /model [free|paid]  show the model in use, or switch tier\n"
             "  /context            show how much context the conversation uses\n"
             "  /verbose [level]    quiet, brief or full - how much result text prints\n"
-            "  /reset              forget the current conversation\n"
+            "  /reset              forget the current conversation (alias /clear)\n"
             "  /undo [list]        put back the files the last request changed;\n"
             "                      'list' shows what is recorded\n"
             "  /help               this list\n"
             "  /exit               leave (Ctrl+D and 'exit' work too)\n"
             "Aliases: /? for /help, /ls for /sessions, /skill for /skills,\n"
             "/auto for /approve, /ctx for /context, /verbosity for /verbose,\n"
-            "/quit for /exit. A bare 'exit' or 'quit' leaves too. An unknown\n"
-            "slash command only prints a warning - it never reaches the model.\n"
+            "/clear for /reset, /quit for /exit. A bare 'exit' or 'quit'\n"
+            "leaves too. An unknown slash command only prints a warning - it\n"
+            "never reaches the model.\n"
             "\n"
             "Skills: type @{name} anywhere in a prompt to load\n"
             "skills/<name>/SKILL.md (or skills/<name>.md) from <workspace>/skills\n"
@@ -5982,7 +5983,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/model [free|paid]", "show the model in use, or switch tier"),
     ("/context", "how much context the conversation uses (alias /ctx)"),
     ("/verbose [level]", "quiet, brief or full (alias /verbosity)"),
-    ("/reset", "forget the current conversation"),
+    ("/reset", "forget the current conversation (alias /clear)"),
     ("/undo", "put back the files the last request changed (/undo list)"),
     ("/help", "this list (alias /?)"),
     ("/exit", "leave (alias /quit; 'exit' and Ctrl+D too)"),
@@ -6254,7 +6255,7 @@ def interactive_loop(harness: Harness) -> None:
                         file=sys.stderr,
                     )
                 continue
-            if word == "/reset":
+            if word in {"/reset", "/clear"}:
                 harness.reset()
                 print("Conversation cleared.")
                 continue
