@@ -774,14 +774,55 @@ class BoundedBuffer:
 
 MAX_RESULT_LINES = 16          # result lines shown before "… +N more lines"
 RESULT_INDENT = "    "
+# A tool argument is shown in full and folded onto as many rows as it needs,
+# because a command you cannot read is a command you cannot approve.
+# ARG_MAX_ROWS is what bounds the block in practice: one argument gets at most
+# that many rows and the last one ends in an ellipsis if more was cut.
+# ARG_VALUE_CHARS is only a backstop against measuring and folding megabytes of
+# text for a single argument, so it sits far above what ARG_MAX_ROWS can show.
+ARG_VALUE_CHARS = 2000
+ARG_MAX_ROWS = 6
+
+
+def _env_int(name: str, default: int) -> int:
+    """A positive integer from the environment, else `default`."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# How wide the transcript is drawn, in characters. Everything the harness
+# prints - model prose, tool calls, tool results, notices - is folded to fit
+# this many columns, so output reads the same on a 200-column terminal as on an
+# 80-column one. 80 is the classic width: comfortable to read, and it leaves
+# room for two panes side by side. Change the number here (or set the
+# HARNESS_WIDTH environment variable) and every block follows; nothing else in
+# the file needs editing.
+OUTPUT_WIDTH = _env_int("HARNESS_WIDTH", 80)
 
 _RESET = "\x1b[0m"
+
+# The grey behind the "run" band. The 16-colour palette only offers two greys -
+# 47 (light) and 100 (dark) - with nothing in between, so the band takes its
+# shade from the 256-colour ramp, where 250 down to 244 are the steps between
+# them. Lower this number for a darker bar, raise it for a lighter one; the
+# text on it stays black, which holds up down to about 240.
+BAND_GREY = 248
+
 _STYLES = {
     "bold": "1", "dim": "2", "italic": "3", "underline": "4",
     "red": "31", "green": "32", "yellow": "33", "blue": "34",
-    "magenta": "35", "cyan": "36", "grey": "90",
+    "magenta": "35", "cyan": "36", "grey": "90", "black": "30",
     "bright_red": "91", "bright_green": "92", "bright_yellow": "93",
     "bright_blue": "94", "bright_magenta": "95", "bright_cyan": "96",
+    # Backgrounds. The band is a mid grey with black text on top, so the
+    # command stays readable whatever the terminal's own foreground colour
+    # happens to be. "bg_light_grey" is the fallback for terminals that cannot
+    # show the 256-colour ramp: the old, lighter bar rather than none.
+    "bg_grey": f"48;5;{BAND_GREY}",
+    "bg_light_grey": "47",
     # The final answer is drawn in this one: bright blue reads as light blue
     # on every terminal that supports the bright range, and it is the only
     # colour the transcript uses for model prose, so the answer stands out.
@@ -828,6 +869,32 @@ def supports_color(stream: Any = None) -> bool:
     if os.environ.get("CLICOLOR_FORCE", "0") not in ("", "0"):
         return True
     return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def supports_256_colors(stream: Any = None) -> bool:
+    """True when the terminal understands the 256-colour palette.
+
+    Only needed for shades the 16-colour palette cannot name - the band grey,
+    for one. TERM says so for the great majority of terminals; COLORTERM does
+    for the truecolour ones, which all speak 256 as well. Anything else (a
+    Linux console, an old xterm, a detached run) is assumed to have just the
+    sixteen, and the callers fall back to a colour from that range.
+    """
+    if not supports_color(stream):
+        return False
+    if "256color" in os.environ.get("TERM", ""):
+        return True
+    colourterm = os.environ.get("COLORTERM", "").lower()
+    return colourterm in {"truecolor", "24bit"}
+
+
+def band_background(stream: Any = None) -> str:
+    """The _STYLES key for the "run" band's background.
+
+    Mid grey where the palette allows it, the old light grey where it does
+    not; black text sits on the band either way.
+    """
+    return "bg_grey" if supports_256_colors(stream) else "bg_light_grey"
 
 
 def encodable(text: str, stream: Any = None) -> bool:
@@ -879,12 +946,22 @@ def begin_answer(stream: Any = None) -> None:
         hook()
 
 
-def term_width(*, minimum: int = 44, maximum: int = 100) -> int:
+def term_width(*, minimum: int = 44, maximum: int | None = None) -> int:
+    """How many columns a line of output may use.
+
+    OUTPUT_WIDTH is the ceiling, so the transcript keeps the same shape on
+    every screen; the terminal's own width can only lower it, never raise it.
+    Folding wider than the window would help nobody - the terminal would
+    hard-wrap the row and the block would lose its left rail. `maximum` lets a
+    caller ask for a tighter budget still. A deliberately tiny OUTPUT_WIDTH
+    also lowers the floor, so a very narrow setting is not silently overruled.
+    """
+    limit = OUTPUT_WIDTH if maximum is None else min(maximum, OUTPUT_WIDTH)
     try:
         columns = shutil.get_terminal_size((80, 24)).columns
     except OSError:
         columns = 80
-    return max(minimum, min(columns, maximum))
+    return max(min(minimum, limit), min(columns, limit))
 
 
 def fit(text: str, limit: int, stream: Any = None) -> str:
@@ -996,24 +1073,84 @@ def banner(stream: Any = None, *, tester: bool = False) -> str:
     return "\n".join(out)
 
 
-def notice(kind: str, text: str, stream: Any = None, *, force: bool = False) -> str:
+def notice(kind: str, text: str, stream: Any = None, *, force: bool = False,
+           style: str | None = None, background: str | None = None) -> str:
     """One aligned status line: "  ▲ warn  message".
 
     Plumbing notices (run/context/usage/skill) are suppressed in quiet mode.
     Warnings and errors always print: hiding a denied command or a retry would
     leave you staring at a stopped agent with no reason given. Pass force=True
     when the user typed a command and is waiting for its answer.
+
+    `style` colours the message itself (not just the glyph and label). The
+    colour is applied to each folded row, after folding, so a long value - a
+    whole shell command, say - can be painted and wrapped at the same time.
+
+    `background` turns the notice into a filled band instead: every row of it,
+    rail and label included, sits on that background and is padded out to the
+    transcript width, so the line reads as a bar across the screen rather than
+    a stripe that stops mid-sentence. Text on a band is drawn in black, which
+    is what keeps a light-to-mid background legible; with colour off there is
+    no band to draw, so nothing is padded and the rows print plain.
+    `background` wins over `style`.
     """
     if not force and not SHOW_NOTICES and kind in {"run", "context", "usage", "skill", "info"}:
         return ""
     glyph_name, colour, label = _NOTICE.get(kind, _NOTICE["info"])
     g = glyphs(stream)
+    head = f"  {g[glyph_name]} "
+    if label:
+        head += label + "  "
     line = paint(f"  {g[glyph_name]} ", colour, stream=stream)
     if label:
         line += paint(label, "bold", colour, stream=stream) + "  "
-    if kind in {"usage", "context", "info"}:
-        text = paint(text, "dim", stream=stream)
-    return line + text
+    dim = kind in {"usage", "context", "info"}
+    # A long message folds under itself, lined up with the text it continues,
+    # instead of running off the right-hand edge of the screen. The fold runs
+    # on the plain text: a colour code must never be split in half.
+    pad = " " * display_width(head)
+    rows = wrap(text, max(20, term_width() - display_width(head)))
+    if background:
+        # Padding is only worth writing when a band will actually be drawn;
+        # piped output and NO_COLOR get the plain rows they always got.
+        fill = term_width() if supports_color(stream) else 0
+        band: list[str] = []
+        for index, row in enumerate(rows):
+            plain = (head if index == 0 else pad) + row
+            plain += " " * max(0, fill - display_width(plain))
+            tone = (("bold", "black", background) if index == 0
+                    else ("black", background))
+            band.append(paint(plain, *tone, stream=stream))
+        return "\n".join(band)
+    if dim:
+        rows = [paint(row, "dim", stream=stream) for row in rows]
+    elif style:
+        rows = [paint(row, style, stream=stream) for row in rows]
+    message = rows[0] + "".join(f"\n{pad}{row}" for row in rows[1:])
+    return line + message
+
+
+def approval_prompt(action: str, detail: str, stream: Any = None) -> str:
+    """The "? Run command  <command>" line, with the detail folded under it.
+
+    `detail` is usually a shell command, and a command you cannot read is a
+    command you cannot approve - so it wraps at the transcript width instead of
+    running off the edge, with the continuation rows lined up under it.
+    """
+    head = (
+        "  " + paint("?", "bold", "yellow", stream=stream)
+        + " " + paint(action, "bold", stream=stream)
+    )
+    # The fold budget excludes the continuation indent, so a wrapped row plus
+    # its padding still fits the transcript width.
+    pad = " " * (display_width("  ? ") + display_width(action) + 2)
+    rows = wrap(detail, max(20, term_width() - display_width(pad)))
+    if not rows[0]:
+        return head
+    return (
+        head + paint("  " + rows[0], "dim", stream=stream)
+        + "".join(f"\n{pad}{paint(row, 'dim', stream=stream)}" for row in rows[1:])
+    )
 
 
 def tier_badge(harness: Harness, stream: Any = None) -> str:
@@ -1021,18 +1158,37 @@ def tier_badge(harness: Harness, stream: Any = None) -> str:
 
     One dim line so the tier in use is always visible: "free  deepseek-v4.1-
     flash:free" or "paid  deepseek-flash". The colour is the point - green for
-    the free tier, yellow for paid - so a glance is enough.
+    the free tier, yellow for paid - so a glance is enough. The context size
+    rides on the same line, so how much of the window the conversation has
+    used is visible without typing /context:
+
+        ● free  deepseek-v4.1-flash:free  • context 3.4k/100k tokens (3%)
     """
     if harness.free:
         label, colour = "free", "green"
     else:
         label, colour = "paid", "yellow"
     g = glyphs(stream)
-    return (
+    head = (
         "  " + paint(g["bullet"], colour, stream=stream)
         + " " + paint(label, "bold", colour, stream=stream)
         + " " + paint(harness.model, "dim", stream=stream)
     )
+    plain_head = f"  {g['bullet']} {label} {harness.model}"
+
+    # Narrow terminals get a shorter tail before the badge is allowed to wrap:
+    # the word "tokens" goes, then the word "context", then the figure itself.
+    summary = context_summary(harness.messages)
+    short = summary.replace(" tokens", "")
+    tails = [f"context {summary}"]
+    for tail in (f"context {short}", short):
+        if tail not in tails:
+            tails.append(tail)
+    for tail in tails:
+        if display_width(f"{plain_head}  {g['bullet']} {tail}") <= term_width():
+            return (head + "  " + paint(f"{g['bullet']} {tail}", "dim",
+                                       stream=stream))
+    return head
 
 
 def _split_at(text: str, budget: int) -> tuple[str, str]:
@@ -1095,6 +1251,20 @@ def _fold_line(line: str, limit: int) -> list[str]:
     return pieces or [""]
 
 
+def wrap(text: str, limit: int) -> list[str]:
+    """Fold every line of `text` so each returned row fits `limit` columns.
+
+    Multi-line text keeps its line breaks; each line is folded on its own with
+    _fold_line(), which also carries the line's indentation onto continuation
+    rows. Folding happens on plain text, before any colour is applied - a line
+    already carrying an escape sequence is left whole by _fold_line().
+    """
+    rows: list[str] = []
+    for line in text.expandtabs(8).splitlines() or [""]:
+        rows.extend(_fold_line(line, limit))
+    return rows or [""]
+
+
 def assistant_block(text: str, stream: Any = None, *, final: bool = False) -> str:
     """The model's prose in a coloured left-bordered block.
 
@@ -1141,21 +1311,28 @@ def assistant_block(text: str, stream: Any = None, *, final: bool = False) -> st
 
 
 def describe_value(value: Any) -> str:
-    """A short, human-sized description of one tool argument."""
+    """A short, human-sized description of one tool argument.
+
+    A one-line string (a shell command, a search pattern, a path) is quoted as
+    it stands, up to ARG_VALUE_CHARS: tool_call_block() folds it onto further
+    rows rather than cutting it off, so what the model is about to run is
+    readable in full. Multi-line values stay summarised by size - dumping a
+    file's contents as escaped JSON would bury the rest of the call.
+    """
     if isinstance(value, str):
         if "\n" in value.strip("\n"):
             lines = value.splitlines() or [""]
             preview = next((line.strip() for line in lines if line.strip()), "")
             suffix = f"  {short(preview, 44)}" if preview else ""
             return f"{len(lines)} lines, {len(value)} chars{suffix}"
-        return short(json.dumps(value, ensure_ascii=False), 70)
+        return short(json.dumps(value, ensure_ascii=False), ARG_VALUE_CHARS)
     if isinstance(value, (bool, int, float)) or value is None:
         return json.dumps(value)
     if isinstance(value, list):
         return f"{len(value)} items"
     if isinstance(value, dict):
         return f"{len(value)} keys"
-    return short(value, 70)
+    return short(value, ARG_VALUE_CHARS)
 
 
 def describe_args(raw_args: str) -> list[tuple[str, str]]:
@@ -1170,6 +1347,12 @@ def describe_args(raw_args: str) -> list[tuple[str, str]]:
 
 def tool_call_block(name: str, raw_args: str, stream: Any = None) -> str:
     """`⚙ write_file` followed by one aligned row per argument.
+
+    A long argument - typically the shell command of execute_command - is
+    folded onto further rows under its own label instead of being cut off with
+    an ellipsis, so what the agent is about to run stays readable at any
+    width. ARG_MAX_ROWS bounds how much room one argument may take; a value
+    cut there ends in an ellipsis, marking that more was left out.
 
     Multi-line arguments such as file contents are summarised by size instead
     of being dumped as one enormous escaped JSON string.
@@ -1186,23 +1369,41 @@ def tool_call_block(name: str, raw_args: str, stream: Any = None) -> str:
     limit = max(16, term_width() - label_w - 10)
     out = [head]
     for label, value in rows:
-        out.append(
-            "      " + paint(label.ljust(label_w), "dim", stream=stream)
-            + "  " + fit(value, limit, stream)
-        )
+        pieces = wrap(value, limit)
+        if len(pieces) > ARG_MAX_ROWS:
+            # Keep the block's shape: the cut is marked, the tail is dropped.
+            # _split_at() peels off a head that fits, so the row keeps its
+            # width budget and only one ellipsis ends up on the line.
+            pieces = pieces[:ARG_MAX_ROWS]
+            mark = g["ellipsis"]
+            room = limit - display_width(mark) - 1
+            pieces[-1] = _split_at(pieces[-1], room)[0].rstrip() + " " + mark
+        for index, piece in enumerate(pieces):
+            # Continuation rows line up under the value they continue, so the
+            # label column stays a column.
+            lead = (
+                paint(label.ljust(label_w), "dim", stream=stream)
+                if index == 0 else " " * label_w
+            )
+            out.append("      " + lead + "  " + piece)
     return "\n".join(out)
 
 
-def diff_line(line: str, stream: Any = None) -> str:
+def _diff_styles(line: str) -> tuple[str, ...]:
+    """The colour a diff line gets, by its first character."""
     if line.startswith(("+++", "---")):
-        return paint(line, "bold", stream=stream)
+        return ("bold",)
     if line.startswith("@@"):
-        return paint(line, "cyan", stream=stream)
+        return ("cyan",)
     if line.startswith("+"):
-        return paint(line, "green", stream=stream)
+        return ("green",)
     if line.startswith("-"):
-        return paint(line, "red", stream=stream)
-    return paint(line, "dim", stream=stream)
+        return ("red",)
+    return ("dim",)
+
+
+def diff_line(line: str, stream: Any = None) -> str:
+    return paint(line, *_diff_styles(line), stream=stream)
 
 
 def result_block(result: str, stream: Any = None, *, summary_only: bool | None = None) -> str:
@@ -1231,6 +1432,8 @@ def result_block(result: str, stream: Any = None, *, summary_only: bool | None =
     is_diff = any(line.startswith("@@") for line in lines) or (
         bool(lines) and lines[0].startswith("--- ")
     )
+    # Room left on a headline row for a quoted reason: "  ↳ ✖ exit 1  ...".
+    room = max(20, term_width() - 16)
 
     # A one-line answer reads best on one line: "↳ Created user.py (120 bytes)".
     # Kept in brief mode as well: it is the outcome of the call, not its body.
@@ -1265,7 +1468,7 @@ def result_block(result: str, stream: Any = None, *, summary_only: bool | None =
                               stream=stream)
                 reason = next((line.strip() for line in body if line.strip()), "")
                 if reason:
-                    head += paint(f"  {short(reason, 70)}", "red", stream=stream)
+                    head += paint(f"  {short(reason, room)}", "red", stream=stream)
                 elif body:
                     head += paint(f" - {len(body)} line(s) of output hidden",
                                   "dim", stream=stream)
@@ -1274,7 +1477,7 @@ def result_block(result: str, stream: Any = None, *, summary_only: bool | None =
             head = paint(f"  {g['result']} ", "grey", stream=stream)
             head += paint(f"{g['fail']} error", "bold", "red", stream=stream)
             if reason:
-                head += paint(f"  {short(reason, 70)}", "red", stream=stream)
+                head += paint(f"  {short(reason, room)}", "red", stream=stream)
         elif is_diff:
             added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
             removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
@@ -1310,14 +1513,20 @@ def result_block(result: str, stream: Any = None, *, summary_only: bool | None =
             label = paint(stripped[:-1], "italic", "grey", stream=stream)
             out.append(RESULT_INDENT + bar + " " + label)
             continue
-        line = fit(line, limit, stream)
+        # A long result line wraps instead of being cut with "…": the text of
+        # a failing command is worth reading in full, and every row carries the
+        # left rail, so the block keeps its shape. The colour is chosen from
+        # the whole line and used for each of its rows, so a folded "+" diff
+        # line stays green.
         if is_diff:
-            rendered = diff_line(line, stream)
+            styles: tuple[str, ...] = _diff_styles(line)
         elif in_stderr:
-            rendered = paint(line, "yellow", stream=stream)
+            styles = ("yellow",)
         else:
-            rendered = line
-        out.append((RESULT_INDENT + bar + " " + rendered).rstrip())
+            styles = ()
+        for piece in _fold_line(line, limit):
+            rendered = paint(piece, *styles, stream=stream) if styles else piece
+            out.append((RESULT_INDENT + bar + " " + rendered).rstrip())
     if hidden > 0:
         out.append(
             RESULT_INDENT + bar + " "
@@ -2073,6 +2282,45 @@ def estimate_tokens(chars: int, messages: int = 0) -> int:
     )
 
 
+def context_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimated tokens the next request has to carry - the /context figure.
+
+    Same arithmetic as /context, so the number on the model line and the one
+    in the panel can never disagree.
+    """
+    return estimate_tokens(sum(message_chars(m) for m in messages), len(messages))
+
+
+def context_budget_tokens() -> int:
+    """The token budget compaction keeps the conversation under; 0 = no limit."""
+    if MAX_HISTORY_CHARS <= 0:
+        return 0
+    return estimate_tokens(MAX_HISTORY_CHARS)
+
+
+def format_tokens(tokens: int) -> str:
+    """A count short enough for a status line: 940, 3.4k, 12.3k, 100k."""
+    if tokens < 1_000:
+        return f"{tokens:,}"
+    thousands = tokens / 1_000
+    if thousands < 100:
+        return f"{thousands:.1f}k"
+    return f"{thousands:.0f}k"
+
+
+def context_summary(messages: list[dict[str, Any]]) -> str:
+    """One-line context size: "3.4k/100k tokens (3%)", "empty", "12.3k tokens"."""
+    tokens = context_tokens(messages)
+    if tokens <= 0:
+        return "empty"
+    budget = context_budget_tokens()
+    if budget <= 0:
+        return f"{format_tokens(tokens)} tokens"
+    share = 100 * tokens / budget
+    percent = "<1%" if share < 1 else f"{share:.0f}%"
+    return f"{format_tokens(tokens)}/{format_tokens(budget)} tokens ({percent})"
+
+
 # --------------------------------------------------------------------------- #
 # Harness
 # --------------------------------------------------------------------------- #
@@ -2458,11 +2706,10 @@ class Harness:
                 )
                 return False
             print()
-            print(
-                "  " + paint("?", "bold", "yellow")
-                + " " + paint(action, "bold")
-                + paint("  " + detail, "dim")
-            )
+            # The detail is where a shell command lands, so it folds under
+            # itself instead of running past the edge: the whole command has
+            # to be readable before it can be approved.
+            print(approval_prompt(action, detail))
             try:
                 answer = read_line(
                     "  " + paint("allow?", "bold", "yellow")
@@ -2847,7 +3094,9 @@ class Harness:
         if not self._approve("Run command", command, dangerous=bool(dangerous_reason)):
             raise ToolError("user denied permission to run the command")
 
-        print(notice("run", paint(command, "bold")))
+        # The command sits on a grey band so a long run of tool calls still
+        # shows at a glance where one command ends and the next begins.
+        print(notice("run", command, background=band_background()))
         try:
             proc = subprocess.Popen(
                 command,
@@ -4192,6 +4441,211 @@ def run_selftest() -> int:
         check("the final answer is drawn in ANSWER_COLOUR",
               _answer_colour)
 
+        # -- one wrap width for every block ---------------------------------
+        def _wrap_width() -> None:
+            """Prose, notices and results all stop at OUTPUT_WIDTH columns.
+
+            The wrap width is a setting, not a guess at the window size: a
+            200-column terminal still gets OUTPUT_WIDTH columns, a narrow one
+            only lowers it, and not one row of any block may overshoot it.
+            """
+            saved = os.environ.get("COLUMNS")
+            try:
+                os.environ["COLUMNS"] = "200"
+                assert term_width() == OUTPUT_WIDTH, (term_width(), OUTPUT_WIDTH)
+
+                prose = assistant_block("word " * 120)
+                for row in prose.splitlines():
+                    assert display_width(row) <= OUTPUT_WIDTH, (display_width(row), row)
+
+                # A long notice wraps under itself, lined up with its text.
+                note = notice("warn", "warning " * 40)
+                rows = note.splitlines()
+                assert len(rows) > 1, note
+                for row in rows:
+                    assert display_width(row) <= OUTPUT_WIDTH, (display_width(row), row)
+                pad = " " * rows[0].index("warning")
+                for row in rows[1:]:
+                    assert row.startswith(pad), row
+                    assert row.strip(), row
+
+                # A long result line wraps instead of being cut with "…":
+                # nothing is lost and every row keeps the left rail.
+                body = "Q" * (OUTPUT_WIDTH * 2)
+                block = result_block(
+                    f"exit_code: 0\nstdout:\n{body}", summary_only=False
+                )
+                bare = strip_ansi(block)
+                assert glyphs()["ellipsis"] not in bare, bare
+                assert bare.count("Q") == len(body), bare.count("Q")
+                for row in bare.splitlines():
+                    assert display_width(row) <= OUTPUT_WIDTH, (display_width(row), row)
+                rows_with_body = [row for row in bare.splitlines() if "QQQ" in row]
+                assert len(rows_with_body) > 1, bare
+                rail = glyphs()["v"]
+                for row in rows_with_body:            # the rail on every fold
+                    assert row.startswith(RESULT_INDENT + rail + " "), row
+
+                # A narrow window still wins: never fold wider than the screen.
+                os.environ["COLUMNS"] = "50"
+                assert term_width() <= 50, term_width()
+            finally:
+                if saved is None:
+                    os.environ.pop("COLUMNS", None)
+                else:
+                    os.environ["COLUMNS"] = saved
+            # The setting comes from the environment; a nonsense value falls
+            # back to the default instead of crashing the import.
+            os.environ["HARNESS_SELFTEST_WIDTH"] = "wat"
+            try:
+                assert _env_int("HARNESS_SELFTEST_WIDTH", 80) == 80
+                assert _env_int("HARNESS_SELFTEST_WIDTH_MISSING", 80) == 80
+            finally:
+                os.environ.pop("HARNESS_SELFTEST_WIDTH", None)
+            os.environ["HARNESS_SELFTEST_WIDTH"] = "120"
+            try:
+                assert _env_int("HARNESS_SELFTEST_WIDTH", 80) == 120
+            finally:
+                os.environ.pop("HARNESS_SELFTEST_WIDTH", None)
+
+        check("every block wraps at OUTPUT_WIDTH", _wrap_width)
+
+        # -- a long command is wrapped, never cut ---------------------------
+        def _command_lines() -> None:
+            """The tool-call row and the allow? prompt show the whole command.
+
+            Both used to put a shell command on one line and cut it with an
+            ellipsis, so the thing being approved was the thing hidden. Now the
+            command folds under its label and every row fits the width.
+            """
+            saved = os.environ.get("COLUMNS")
+            try:
+                os.environ["COLUMNS"] = "200"
+                assert term_width() == OUTPUT_WIDTH, term_width()
+
+                # A command that needs a few rows, sized for the width in
+                # force: this check means the same thing at 40 columns as at
+                # 80, and stays under ARG_MAX_ROWS so nothing is cut.
+                per_row = max(16, term_width() - len("command") - 10)
+                command = "python3 build.py" + " --flag=value" * max(
+                    2, (per_row * 3) // len(" --flag=value")
+                )
+                block = strip_ansi(
+                    tool_call_block("execute_command",
+                                    json.dumps({"command": command}))
+                )
+                rows = block.splitlines()
+                assert len(rows) > 2, block
+                assert glyphs()["ellipsis"] not in block, block
+                # Nothing lost: the command survives folding in one piece.
+                squashed = "".join(block.split())
+                assert command.replace(" ", "") in squashed, squashed
+                lead = " " * (6 + len("command") + 2)   # the value column
+                assert rows[1].lstrip().startswith('command  "'), rows[1]
+                for row in rows[2:]:                    # continuation rows
+                    assert display_width(row) <= OUTPUT_WIDTH, row
+                    assert row.startswith(lead), row
+                for row in rows[1:]:
+                    assert display_width(row) <= OUTPUT_WIDTH, row
+
+                # A pathologically long argument is bounded and marked.
+                capped = strip_ansi(
+                    tool_call_block("execute_command",
+                                    json.dumps({"command": "x" * 4000}))
+                ).splitlines()
+                assert len(capped) == 1 + ARG_MAX_ROWS, capped
+                assert capped[-1].rstrip().endswith(glyphs()["ellipsis"]), capped[-1]
+                for row in capped[1:]:
+                    assert display_width(row) <= OUTPUT_WIDTH, row
+
+                # The allow? prompt wraps the command under the action name.
+                prompt = strip_ansi(approval_prompt("Run command", command))
+                prompt_rows = prompt.splitlines()
+                assert len(prompt_rows) > 1, prompt
+                assert prompt_rows[0].startswith("  ? Run command  "), prompt_rows[0]
+                assert "Run command" in prompt_rows[0], prompt_rows[0]
+                pad = " " * display_width("  ? Run command  ")
+                for row in prompt_rows[1:]:
+                    assert row.startswith(pad), row
+                    assert row.strip(), row
+                for row in prompt_rows:
+                    assert display_width(row) <= OUTPUT_WIDTH, row
+                assert command.replace(" ", "") in "".join(prompt.split()), prompt
+
+                # The "run" line echoes the command it is about to run, and
+                # still folds when it does not fit on one row.
+                echo = notice("run", command, force=True, style="bold")
+                if supports_color():
+                    # Bold is applied per folded row, never to half a code.
+                    assert echo.count("\x1b[1m") == len(echo.splitlines()), echo
+                for row in strip_ansi(echo).splitlines():
+                    assert display_width(row) <= OUTPUT_WIDTH, row
+                echo_rows = strip_ansi(echo).splitlines()
+                assert len(echo_rows) > 1, echo
+                pad = " " * echo_rows[0].index(command.split()[0])
+                for row in echo_rows[1:]:
+                    assert row.startswith(pad), row
+
+                # The run line the harness actually prints is a filled band:
+                # every folded row carries the band background and is padded
+                # to the transcript width, so a long command reads as one bar
+                # across the screen instead of a ragged stripe.
+                class _Tty:                     # a stream that claims colour
+                    encoding = "utf-8"
+
+                    def isatty(self) -> bool:
+                        return True
+
+                tty = _Tty()
+                # The shade follows the terminal: the 256-colour ramp where it
+                # exists, the old 16-colour light grey where it does not, and
+                # black text either way.
+                band_key = band_background(tty)
+                if supports_256_colors(tty):
+                    assert band_key == "bg_grey", band_key
+                    assert _STYLES["bg_grey"] == f"48;5;{BAND_GREY}"
+                else:
+                    assert band_key == "bg_light_grey", band_key
+                band_code = f"\x1b[{_STYLES[band_key]}m"
+                band_rows = notice("run", command, force=True, stream=tty,
+                                   background=band_key).splitlines()
+                assert len(band_rows) > 1, band_rows
+                if supports_color(tty):
+                    for row in band_rows:                 # band on every row
+                        assert band_code in row, row
+                        assert "\x1b[30m" in row, row     # black text on it
+                    assert "\x1b[1m" in band_rows[0], band_rows[0]
+                    # The rail and label sit on the band too, not beside it.
+                    assert strip_ansi(band_rows[0]).startswith(
+                        "  " + glyphs(tty)["arrow"] + " run  "
+                    ), band_rows[0]
+                    for row in band_rows:                 # a bar, not a stripe
+                        assert display_width(row) == term_width(), row
+                else:                       # NO_COLOR or TERM=dumb wins
+                    assert "\x1b[" not in band_rows[0], band_rows[0]
+                    for row in band_rows:   # no band to draw, no padding
+                        assert display_width(row) <= term_width(), row
+                        assert not row.endswith(" "), row
+
+                # A short command stays on one line - no wrap for its own sake.
+                short_rows = strip_ansi(
+                    tool_call_block("execute_command",
+                                    json.dumps({"command": "ls -la"}))
+                ).splitlines()
+                assert len(short_rows) == 2, short_rows
+                assert short_rows[1].endswith('"ls -la"'), short_rows[1]
+
+                # A multi-line content argument is still summarised by size.
+                summary = describe_value("one\ntwo\nthree")
+                assert summary.startswith("3 lines, 13 chars"), summary
+            finally:
+                if saved is None:
+                    os.environ.pop("COLUMNS", None)
+                else:
+                    os.environ["COLUMNS"] = saved
+
+        check("long commands wrap instead of being cut", _command_lines)
+
         # -- line input ------------------------------------------------------
         def _editing_keys() -> None:
             # Backspace (both codes) must delete, not append a character.
@@ -4406,6 +4860,71 @@ def run_selftest() -> int:
 
         check("/context survives an empty conversation and disabled compaction",
               _context_handles_empty_and_unbounded)
+
+        def _context_on_the_model_line() -> None:
+            badge = make_harness()
+            badge.model = "some-model:free"
+            assert context_summary([]) == "empty", context_summary([])
+            assert format_tokens(940) == "940", format_tokens(940)
+            assert format_tokens(3_400) == "3.4k", format_tokens(3_400)
+            assert format_tokens(12_345) == "12.3k", format_tokens(12_345)
+            assert format_tokens(100_000) == "100k", format_tokens(100_000)
+
+            # No messages at all says so instead of printing "0/100k".
+            badge.messages = []
+            line = strip_ansi(tier_badge(badge, stream=io.StringIO()))
+            assert "some-model:free" in line, line
+            assert "• context empty" in line or "- context empty" in line, line
+
+            # A fresh harness already carries the system prompt, and the badge
+            # counts it - it is part of every request.
+            badge.messages = [{"role": "user", "content": "x" * 40}]
+            line = strip_ansi(tier_badge(badge, stream=io.StringIO()))
+            assert "empty" not in line, line
+            if term_width() >= 40:      # room for the shortest form
+                assert "14/100k" in line, line
+
+            # The figure is the same one /context reports, next to the model.
+            badge.messages = [{"role": "user", "content": "x" * 40_000}]
+            expected = context_summary(badge.messages)
+            assert expected == "10.0k/100k tokens (10%)", expected
+            line = strip_ansi(tier_badge(badge, stream=io.StringIO()))
+            assert "some-model:free" in line, line
+            # Narrow terminals lose the wording first, then the figure itself,
+            # so the badge never wraps onto a second line.
+            bullet = glyphs(io.StringIO())["bullet"]
+            head = f"  {bullet} free some-model:free"
+            ladder = (
+                (f"{head}  {bullet} context {expected}", f"context {expected}"),
+                (f"{head}  {bullet} context 10.0k/100k (10%)",
+                 "context 10.0k/100k (10%)"),
+                (f"{head}  {bullet} 10.0k/100k (10%)", "10.0k/100k (10%)"),
+            )
+            for whole, tail in ladder:
+                if display_width(whole) <= term_width():
+                    assert tail in line, line
+                    break
+            else:
+                assert line.strip().endswith("some-model:free"), line
+
+            # Compaction off means no denominator to divide by.
+            global MAX_HISTORY_CHARS
+            saved = MAX_HISTORY_CHARS
+            try:
+                MAX_HISTORY_CHARS = 0
+                assert context_summary(badge.messages) == "10.0k tokens", \
+                    context_summary(badge.messages)
+            finally:
+                MAX_HISTORY_CHARS = saved
+
+            # A model name too long for the terminal drops the figure rather
+            # than wrapping the badge onto a second line.
+            badge.model = "m" * 120
+            line = strip_ansi(tier_badge(badge, stream=io.StringIO()))
+            assert "context" not in line, line
+            assert line.strip().endswith("m" * 120), line[-30:]
+
+        check("the model line carries the context size", _context_on_the_model_line)
 
         # -- saved conversations --------------------------------------------
         def _session_roundtrip() -> None:
@@ -5317,7 +5836,7 @@ def show_commands(tester: bool = False) -> None:
 
 
 def show_skills(harness: Harness) -> None:
-    """Print the skill names and nothing else - a one-line answer on purpose."""
+    """Print the skill names - one line when they fit, folded when they do not."""
     skills = harness.skills.discover()
     if not skills:
         # Name every folder that was searched, so the user knows where a skill
@@ -5326,7 +5845,13 @@ def show_skills(harness: Harness) -> None:
         print(notice("info", f"no skills yet - add <name>/SKILL.md in {roots}",
                      force=True))
         return
-    print(paint("skills: ", "bold", "cyan") + ", ".join(skill.name for skill in skills))
+    label = "skills: "
+    pad = " " * display_width(label)
+    rows = wrap(", ".join(skill.name for skill in skills),
+                max(20, term_width() - display_width(label)))
+    print(paint(label, "bold", "cyan") + rows[0])
+    for row in rows[1:]:                 # a long list folds under the label
+        print(pad + row)
 
 
 def show_context(harness: Harness) -> None:
@@ -5345,7 +5870,9 @@ def show_context(harness: Harness) -> None:
 
     total = sum(tally.values())
     count = len(harness.messages)
-    tokens = estimate_tokens(total, count)
+    # Same helper the prompt's model line uses, so the badge and this panel
+    # always agree.
+    tokens = context_tokens(harness.messages)
 
     rows: list[tuple[str, str]] = [
         (role, f"{tally[role]:,} chars") for role in tally if tally[role]
@@ -5393,7 +5920,7 @@ def show_sessions(harness: Harness) -> list[dict[str, Any]]:
     for index, item in enumerate(sessions, 1):
         print(
             paint(f"  {index:>2}. ", "bold", "cyan")
-            + item["name"]
+            + fit(item["name"], max(16, width - 42), stream=sys.stdout)
             + paint(f"   {item['messages']} messages   {item['saved_at']}", "dim")
         )
         preview = fit(item["preview"], max(20, width - 8))
@@ -5432,7 +5959,8 @@ def show_undo(harness: Harness, argument: str = "") -> None:
     print(notice("ok", f"undid {result['group']}: restored "
                        f"{len(result['restored'])} path(s)"))
     for line in result["restored"]:
-        print(paint("  " + line, "dim"))
+        for row in wrap("  " + line, term_width()):
+            print(paint(row, "dim"))
     if result["remaining"]:
         print(paint(f"  {result['remaining']} earlier change(s) still undoable",
                     "dim"))
@@ -5489,7 +6017,7 @@ def interactive_loop(harness: Harness) -> None:
         "info",
         "/help explains them and gives the aliases. At an allow? prompt: "
         "y or n, or 'always' to stop asking for the rest of the session "
-        "(Ctrl+C stops a running loop)",
+        "(Ctrl+C stop loop)",
     ))
     entered: list[str] = []          # up-arrow recalls what you typed
     while True:
@@ -5537,10 +6065,9 @@ def interactive_loop(harness: Harness) -> None:
                 continue
             if word == "/model":
                 if argument == "":
-                    tier = "free" if harness.free else "paid"
-                    print(paint(f"\n  {tier}", "bold",
-                                "green" if harness.free else "yellow")
-                          + paint(f"  {harness.model}", "dim"))
+                    # The same line that sits above the prompt, so the answer
+                    # carries the context size too instead of a bare model name.
+                    print("\n" + tier_badge(harness))
                 elif argument in {"free", "paid"}:
                     try:
                         harness.set_free(argument == "free")
@@ -5656,7 +6183,9 @@ def main() -> int:
 
     workspace = Path(args.workspace).expanduser()
     if not workspace.is_dir():
-        print(f"Error: workspace is not a directory: {workspace}", file=sys.stderr)
+        for row in wrap(f"Error: workspace is not a directory: {workspace}",
+                        term_width()):
+            print(row, file=sys.stderr)
         return 2
 
     harness = Harness(
@@ -5697,7 +6226,10 @@ def main() -> int:
 
     if args.no_banner:
         for label, value in rows:
-            print(f"{label + ':':<10} {value}")
+            head = f"{label + ':':<10} "
+            paired = wrap(value, max(20, term_width() - len(head)))
+            for index, row in enumerate(paired):
+                print((head if index == 0 else " " * len(head)) + row)
     else:
         print()
         print(banner(tester=harness.tester))

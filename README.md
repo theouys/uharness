@@ -258,16 +258,29 @@ honours.
 | WSL | Fully supported | Behaves as Linux |
 | FreeBSD / OpenBSD | Expected to work | Untested; uses standard POSIX APIs |
 
-The agent adjusts to its environment in three places:
+The agent adjusts to its environment in four places:
 
 - **Blocked or missing Unicode.** The logo, box-drawing characters and status
   glyphs fall back to plain ASCII when the terminal's encoding cannot print
   them, so it stays readable on a bare console.
+- **Line width.** Everything printed — model prose, tool calls, tool results
+  and status lines — wraps at 80 characters, whatever the window is doing, so
+  the transcript looks the same on a 200-column terminal as on an 80-column
+  one. A narrower window only lowers the wrap, never raises it. The number
+  lives in one place, `OUTPUT_WIDTH` near the top of `uharness.py`, and can be
+  overridden with `HARNESS_WIDTH`.
 - **Colour.** ANSI colour switches itself off when output is piped or
   redirected, and is disabled entirely by `NO_COLOR=1`, `TERM=dumb`, or when
   `CLICOLOR_FORCE` is unset and stdout is not a TTY. The model's final answer
   is the one block drawn in light blue, so it stands out from the green
-  running commentary; the desktop window follows the same rule.
+  running commentary; the desktop window follows the same rule. Each command
+  the agent runs is echoed on a grey band — dark text on a padded bar across
+  the full width — so a long stretch of tool calls still shows at a glance
+  where one command ends and the next begins. The shade is `BAND_GREY` near
+  the top of `uharness.py`: a step off the 256-colour ramp, with the lighter
+  16-colour grey used instead when `TERM`/`COLORTERM` say the terminal cannot
+  show it. With colour off there is no band to draw, so those lines print
+  plain and unpadded.
 - **Process killing.** Timeouts kill the whole process tree — via process
   groups on POSIX and `taskkill /T` on Windows.
 
@@ -391,7 +404,10 @@ uharness-ui --help
 In the window: Enter sends, Shift+Enter adds a line, Ctrl+↑/↓ walks the prompt
 history, Ctrl+S saves the conversation, Ctrl+O opens one, Ctrl+Shift+Z undoes
 the last request's file changes, Ctrl+L clears the feedback pane and Ctrl+Q
-quits. The terminal "allow?" prompt becomes a dialog
+quits. The header shows the tier, the model and the context size the
+conversation is using (`● free  deepseek-v4.1-flash:free  · context
+908/100k tokens (<1%)`), refreshed after every turn. The terminal "allow?"
+prompt becomes a dialog
 with *Allow once*, *Deny* and *Always allow* - the dangerous-command blocklist,
 `--dry-run` and auto-approval all still apply. The UI imports `uharness.py`
 rather than copying it, so the tools, skills, saved sessions, autosave and
@@ -644,12 +660,18 @@ important.** Use `--dry-run` first when a task touches a lot of files.
 ## Interactive mode
 
 Run `uharness` with no prompt, or with `-i`. The prompt line shows the active
-tier above it:
+tier and model above it, with the context size the conversation is using:
 
 ```
-  ● free deepseek-v4.1-flash:free
+  ● free  deepseek-v4.1-flash:free  • context 908/100k tokens (<1%)
 you> 
 ```
+
+The figure on the right is the estimated token count of the request the next
+turn will send, over the budget compaction keeps it under — the same numbers
+`/context` breaks down by role. It is redrawn every turn, so a long session
+shows its own growth. A very long model name, or a narrow window, shortens the
+tail (`• 10.0k/100k (10%)`) or drops it rather than wrapping the line.
 
 You get a proper line editor: backspace works, the arrow keys move and recall
 history, Ctrl+U kills the line, Ctrl+W deletes a word, Ctrl+C stops the current
@@ -664,7 +686,7 @@ request, Ctrl+D (or `/exit`) leaves.
 | `/sessions` | List saved conversations without opening one. Alias: `/ls`. |
 | `/skills` | List the skill names available to this agent (workspace and bundled). Alias: `/skill`. |
 | `/approve [on\|off]` | Stop or start asking before write/edit/delete/execute. Blank toggles. Alias: `/auto`. |
-| `/model [free\|paid]` | Show the model in use, or switch tier. Blank shows it. |
+| `/model [free\|paid]` | Show the model in use and the context size, or switch tier. Blank shows it, with the same line that sits above the prompt. |
 | `/context` | Show how much context the conversation is using. Alias: `/ctx`. |
 | `/verbose [full\|brief\|quiet]` | How much of each tool result is printed. Blank prints the level in force. Alias: `/verbosity`. |
 | `/reset` | Forget the current conversation, keep the session alive. |
@@ -714,7 +736,7 @@ writes and the save on exit — for when you want a run that leaves no trace.
 
 ```
 you> /model
-  free  deepseek-v4.1-flash:free
+  ● free  deepseek-v4.1-flash:free  • context 908/100k tokens (<1%)
 you> /model paid
   ● ok  now using the paid model: deepseek-flash at https://api.deepseek.com
 ```
@@ -745,7 +767,10 @@ tool output the model has already used. Ask for `/context` to see the breakdown:
 ```
 
 Character counts are exact. Token counts are an estimate — the harness does not
-tokenise locally — so treat them as a rough guide.
+tokenise locally — so treat them as a rough guide. The same estimate is the
+figure shown next to the model above the prompt (`• context 6.1k/100k tokens
+(6%)`), redrawn every turn, so the panel is only needed for the per-role
+breakdown.
 
 ---
 
@@ -928,10 +953,11 @@ somewhere else entirely.
 | `HARNESS_MAX_HISTORY_CHARS` | `400000` | Compaction threshold. `0` disables it. |
 | `HARNESS_SKILLS_DIR` | *(unset)* | Where skills are looked up. Unset: `<workspace>/skills` **and** the `skills/` folder next to `uharness.py`. Set: replaces both, `:`-separated (`;` on Windows) for several folders. |
 | `HARNESS_INPUT` | *(auto)* | Set to `builtin` to use Python's plain `input()` instead of the arrow-key editor. |
+| `HARNESS_WIDTH` | `80` | Columns the output wraps at. Same setting as `OUTPUT_WIDTH` in `uharness.py`. |
 | `NO_COLOR` | *(unset)* | Set to anything to disable ANSI colour. |
 | `CLICOLOR_FORCE` | *(unset)* | Non-zero forces colour even when piped. |
 | `TERM` | *(auto)* | `dumb` disables colour. |
-| `COLUMNS` | *(auto)* | Overrides detected terminal width. |
+| `COLUMNS` | *(auto)* | Detected terminal width. It can only lower the wrap, never raise it past `HARNESS_WIDTH`. |
 
 Because both endpoints are configurable, you can point the harness at any
 OpenAI-compatible server — a local model, an internal gateway, or another

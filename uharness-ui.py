@@ -1332,6 +1332,7 @@ class HarnessUI:
                 "U-HARNESS UI - the agent harness, with a window.",
                 "",
                 f"model:      {harness.model} ({'free' if harness.free else 'paid'})",
+                f"context:    {core.context_summary(harness.messages)}",
                 f"role:       {'tester (report only)' if harness.tester else 'developer'}",
                 f"workspace:  {harness.workspace}",
                 f"sessions:   {harness.rel(harness.sessions_dir)}",
@@ -1358,8 +1359,11 @@ class HarnessUI:
         self.var_tier.set("free" if harness.free else "paid")
 
         tier = "free" if harness.free else "paid"
+        # Same shape as the terminal badge: the context size sits next to the
+        # model, so the room left in the window is always on screen.
         self.badge.configure(
-            text=f"\u25cf {tier}  {harness.model}",
+            text=(f"\u25cf {tier}  {harness.model}"
+                  f"  \u00b7 context {core.context_summary(harness.messages)}"),
             foreground=GREEN if harness.free else YELLOW,
         )
         approval = "auto-approve" if harness.auto_approve else "ask first"
