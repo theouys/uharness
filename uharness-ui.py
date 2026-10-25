@@ -310,6 +310,91 @@ class ApprovalDialog:
         self.app.resolve_approval(self.box, allow, always=always)
 
 
+class QuestionDialog:
+    """The agent's question, as a window with a box you can type in."""
+
+    def __init__(self, app: HarnessUI, box: dict[str, Any],
+                 question: str) -> None:
+        self.app = app
+        self.box = box
+
+        win = tk.Toplevel(app.root)
+        win.title("The agent has a question")
+        win.transient(app.root)
+        win.configure(bg=BG)
+        win.resizable(True, False)
+        win.protocol("WM_DELETE_WINDOW", self._skip)
+
+        tk.Label(
+            win, text="The agent asks",
+            bg=BG, fg=CYAN, font=(app.family, app.size + 1, "bold"),
+            anchor="w", justify="left",
+        ).pack(fill="x", padx=16, pady=(16, 4))
+
+        tk.Label(
+            win, text=question, bg=BG, fg=FG, anchor="w", justify="left",
+            wraplength=620, font=(app.family, app.size),
+        ).pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        self.text = tk.Text(
+            win, height=3, wrap="word", undo=True,
+            bg=INPUT_BG, fg=FG, insertbackground=FG,
+            selectbackground="#33507a", selectforeground="#ffffff",
+            relief="flat", bd=0, padx=10, pady=8,
+            font=(app.family, app.size + 1), highlightthickness=1,
+            highlightbackground="#2b303a", highlightcolor="#3d6399",
+        )
+        self.text.pack(fill="x", padx=16)
+
+        tk.Label(
+            win,
+            text=("Enter answers, Shift+Enter adds a line. Escape skips the "
+                  "question and the agent carries on without an answer."),
+            bg=BG, fg=DIM, anchor="w", justify="left", wraplength=620,
+            font=(app.family, app.size - 1),
+        ).pack(fill="x", padx=16, pady=(4, 12))
+
+        buttons = tk.Frame(win, bg=BG)
+        buttons.pack(fill="x", padx=16, pady=(0, 16))
+        make_button(buttons, "Answer", self._answer, primary=True)
+        make_button(buttons, "Skip", self._skip)
+        for widget in buttons.winfo_children():
+            widget.pack(side="right", padx=(8, 0))
+
+        self.text.bind("<Return>", self._on_return)
+        self.text.bind("<Escape>", lambda _event: (self._skip(), "break")[1])
+        win.bind("<Escape>", lambda _event: self._skip())
+        win.update_idletasks()
+        self._centre(win)
+        win.grab_set()
+        self.text.focus_set()
+
+        self.win = win
+        box["dialog"] = win
+
+    def _centre(self, win: tk.Toplevel) -> None:
+        root = self.app.root
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - win.winfo_width()) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - win.winfo_height()) // 3)
+        win.geometry(f"+{x}+{y}")
+
+    def _on_return(self, event: tk.Event) -> str | None:
+        if event.state & 0x0001:      # Shift held: keep the newline
+            return None
+        self._answer()
+        return "break"
+
+    def _answer(self) -> None:
+        answer = self.text.get("1.0", "end-1c").strip()
+        if not answer:
+            self.app.notice("warn", "type an answer, or press Skip")
+            return
+        self.app.resolve_question(self.box, answer)
+
+    def _skip(self) -> None:
+        self.app.resolve_question(self.box, None)
+
+
 class SessionPicker:
     """Pick a saved conversation from a list instead of typing its number."""
 
@@ -428,6 +513,7 @@ class HarnessUI:
         self.busy = False
         self.worker_ident: int | None = None
         self.approvals: list[dict[str, Any]] = []
+        self.questions: list[dict[str, Any]] = []
         self.history: list[str] = []
         self.history_pos = 0
         self.closed = False
@@ -500,6 +586,10 @@ class HarnessUI:
             return app.ask_approval(action, detail, dangerous=dangerous)
 
         harness._approve = approve  # type: ignore[method-assign]
+        # ask_user goes the same way: the harness prints the question into the
+        # pane, then this hook opens the dialog and blocks the worker until the
+        # answer is typed there.
+        harness.ask_hook = app.ask_question
 
     def _build_widgets(self) -> None:
         root = self.root
@@ -850,6 +940,11 @@ class HarnessUI:
                 elif kind == "approval":
                     _, box, action, detail, dangerous = item
                     self.show_approval(box, action, detail, dangerous)
+                elif kind == "question":
+                    _, box, question = item
+                    self.show_question(box, question)
+                elif kind == "cancel_question":
+                    self.resolve_question(item[1], None)
                 elif kind == "done":
                     self.finish_busy(item[1] if len(item) > 1 else None)
             self._flush_text()
@@ -906,6 +1001,54 @@ class HarnessUI:
             self.approvals.remove(box)
         box["event"].set()
         self.sync_vars()
+
+    # -- questions ---------------------------------------------------------- #
+
+    def ask_question(self, question: str) -> str:
+        """Block the worker until the question dialog supplies a typed answer.
+
+        The wait is a poll rather than a plain Event.wait so that Stop still
+        works while the dialog is open: a pending KeyboardInterrupt is only
+        raised when the thread is back in Python, which a polling wait lets it
+        be. Skipping ("" or Escape) is a normal answer, not an error.
+        """
+        event = threading.Event()
+        box: dict[str, Any] = {"event": event, "answer": None, "dialog": None}
+        self.events.put(("question", box, question))
+        try:
+            while not event.wait(0.05):
+                pass
+        except KeyboardInterrupt:
+            # Stop pressed while the dialog is up. Tk must do the destroying,
+            # so ask the pump to close it and then let the interrupt unwind.
+            self.events.put(("cancel_question", box))
+            raise
+        answer = box["answer"]
+        return "" if answer is None else str(answer)
+
+    def show_question(self, box: dict[str, Any], question: str) -> None:
+        """Tk side of ask_question: put the dialog up and let the pump continue."""
+        if self.closed:
+            self.resolve_question(box, None)
+            return
+        self.questions.append(box)
+        QuestionDialog(self, box, question)
+
+    def resolve_question(self, box: dict[str, Any], answer: str | None) -> None:
+        """Answer a pending question exactly once, then release the worker."""
+        if box["event"].is_set():
+            return
+        box["answer"] = answer
+        dialog = box.get("dialog")
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:  # pragma: no cover
+                pass
+        if box in self.questions:
+            self.questions.remove(box)
+        box["event"].set()
 
     # -- running a request -------------------------------------------------- #
 
@@ -1460,6 +1603,8 @@ class HarnessUI:
                 return
             for box in list(self.approvals):
                 self.resolve_approval(box, False)
+            for box in list(self.questions):
+                self.resolve_question(box, None)
             self.stop()
         self.autosave_on_exit()
         self.closed = True

@@ -526,7 +526,7 @@ bindings added.
 ```
 
 Start with `--tester` and two lines change: the `/approve` row reads "ask before
-report writes and commands", and the panel reports 7 tools instead of 8.
+report writes and commands", and the panel reports 8 tools instead of 9.
 
 ---
 
@@ -822,9 +822,12 @@ replaced is the terminal `allow?` line, which becomes a modal dialog with
 **Allow once**, **Deny** and **Always allow** (`Enter` allows, `Esc` denies).
 **Always allow** throws the same switch as `/approve off` in the terminal — the
 *Agent → Auto-approve tools* checkbox, which the window keeps in step with the
-harness as you type commands. Autosave is the same store, so a conversation
-begun in the window can be resumed with `/open` in the terminal, and the other
-way round.
+harness as you type commands. The same goes for `ask_user`: the question opens
+its own dialog with a text box, **Answer** and **Skip** (`Enter` answers,
+`Shift+Enter` adds a line, `Esc` skips), and both the question and what you
+typed are written into the feedback pane. Autosave is the same store, so a
+conversation begun in the window can be resumed with `/open` in the terminal,
+and the other way round.
 
 Needs tkinter and a display. macOS and the python.org Windows builds include it;
 on Debian or Ubuntu install it with `sudo apt install python3-tk`. The terminal
@@ -991,6 +994,7 @@ The agent is a tool-calling loop:
 | `append_file` | yes | Append to a file. |
 | `delete_file` | yes | Delete a file, or a directory with `recursive=true`. **Not offered in `--tester` mode.** |
 | `execute_command` | yes | Run a shell command with a timeout. |
+| `ask_user` | never | Put a question to you and wait for the typed answer. See below. |
 
 In `--tester` mode the write tools are still listed but pointed at one path:
 `write_file`, `edit_file` and `append_file` accept only
@@ -1009,6 +1013,31 @@ A few deliberate design choices:
 - **The display never leaks.** Coloured and formatted output is for your eyes
   only. Tool results are constructed separately, so escape codes cannot reach
   the conversation history or the log file.
+
+### Asking you a question
+
+`ask_user` is the one tool that stops and waits for you. The model is told to
+reach for it when a decision is genuinely yours — which of two approaches, which
+file, whether to overwrite something — rather than guessing and hoping:
+
+```
+  ? question  Which database should the examples use?
+  answer (blank skips): postgres
+```
+
+- Whatever you type comes back to the model as typed, inner spacing and
+  newlines included (only leading and trailing whitespace is trimmed), so a
+  short list or a couple of sentences are both fine.
+- Blank, or Ctrl-D, skips the question. The model is told it was skipped and to
+  make the most reasonable choice itself, so a skip never stalls the run.
+- Ctrl-C at the question aborts the request, exactly as it does at an `allow?`
+  prompt.
+- `--yes` never answers it. A question is not a permission slip: auto-approve
+  covers the write tools, and the answer still has to come from you.
+- With no terminal attached — a pipe, a cron job — the question is skipped with
+  a warning rather than blocking forever.
+- It is in the tool menu in both modes, so a `--tester` run can ask you
+  something too.
 
 ### The dangerous-command blocklist
 

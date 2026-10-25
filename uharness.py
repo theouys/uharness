@@ -183,6 +183,14 @@ SESSION_PREVIEW_CHARS = 60               # first user line shown in /sessions
 REPORT_PATH = Path(SESSION_DIR_NAME) / "Testing.md"
 TESTER = False   # set from --tester in main(); Harness(tester=...) overrides
 
+# ask_user stops the loop and waits for the human. A skipped answer is a normal
+# result, not an error, so the model knows to carry on instead of asking again.
+ASK_SKIPPED = (
+    "The user did not answer - they skipped the question. Do not ask it again "
+    "in this request: make the most reasonable choice yourself and say what "
+    "you assumed."
+)
+
 # Skills: reusable instruction packs the user loads with @{skill-name}.
 # Each skill is skills/<name>/SKILL.md, or a single skills/<name>.md file.
 # Two folders are searched by default: <workspace>/skills and the skills/
@@ -239,6 +247,10 @@ Rules:
    created or changed, and show any important command output.
 10. If a tool returns an error, fix the problem and retry, or explain the
     blocker to the user. Do not invent results.
+11. When a decision is genuinely the user's - which of two approaches, which
+    file, whether to replace something - use ask_user and wait for the typed
+    answer instead of guessing. Do not use it to ask permission: the approval
+    prompt already does that.
 """
 
 TESTER_SYSTEM_PROMPT = """\
@@ -609,6 +621,33 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the user a question and wait for a typed answer. Use this "
+                "only when the decision is genuinely theirs and guessing wrong "
+                "would waste work - which of two approaches, which file, "
+                "whether to overwrite something. Permission to run a tool is "
+                "asked for separately, so never use this for that. Returns "
+                "what the user typed, or a note saying they skipped it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "The question to put to the user, in one or two "
+                            "sentences."
+                        ),
+                    },
+                },
+                "required": ["question"],
             },
         },
     },
@@ -1150,6 +1189,37 @@ def approval_prompt(action: str, detail: str, stream: Any = None) -> str:
     return (
         head + paint("  " + rows[0], "dim", stream=stream)
         + "".join(f"\n{pad}{paint(row, 'dim', stream=stream)}" for row in rows[1:])
+    )
+
+
+def question_block(question: str, stream: Any = None) -> str:
+    """The agent's question to the user, folded under a "? question" head."""
+    head = (
+        "  " + paint("?", "bold", "cyan", stream=stream)
+        + " " + paint("question", "bold", stream=stream)
+    )
+    pad = " " * (display_width("  ? question") + 2)
+    rows = wrap(question, max(20, term_width() - display_width(pad)))
+    if not rows[0]:
+        return head
+    return (
+        head + paint("  " + rows[0], "bold", stream=stream)
+        + "".join(f"\n{pad}{paint(row, 'bold', stream=stream)}" for row in rows[1:])
+    )
+
+
+def answer_echo(answer: str, stream: Any = None) -> str:
+    """Echo an answer typed in a window, where no terminal echoes it.
+
+    The terminal's own prompt already shows what was typed, so this line is
+    only printed when the answer came back through Harness.ask_hook.
+    """
+    prompt = glyphs(stream)["prompt"]
+    rows = (answer or "").splitlines() or [""]
+    return (
+        "  " + paint(prompt, "bold", "blue", stream=stream)
+        + " " + paint(rows[0], "bold", "blue", stream=stream)
+        + "".join(f"\n    {paint(row, 'blue', stream=stream)}" for row in rows[1:])
     )
 
 
@@ -2390,6 +2460,10 @@ class Harness:
         self.api_key = api_key
         self.free = self._infer_free()
         self.client = self._build_client()
+        # The desktop window sets this to a callable that puts a question in
+        # its own dialog and returns the text typed there. None means "use the
+        # terminal prompt" (see ask_user).
+        self.ask_hook: collections.abc.Callable[[str], str] | None = None
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt()}
         ]
@@ -2741,6 +2815,56 @@ class Harness:
                 "answer y, n or always - /approve on and /approve off work here too",
                 stream=sys.stderr,
             ), file=sys.stderr)
+
+    # -- asking the user ---------------------------------------------------- #
+    #
+    # ask_user is the one tool that deliberately stops and waits for the human.
+    # It goes through the same "type an answer" path in both front ends: the
+    # terminal reads a line at the prompt, and the desktop window hands over a
+    # callable (ask_hook) that opens a dialog with a text box. Nothing here is
+    # gated by auto-approve - a question is not a permission slip, and --yes
+    # must not answer it on the user's behalf.
+
+    def ask_user(self, question: str) -> str:
+        """Put `question` to the user and return the typed answer ("" = skip)."""
+        text = (question or "").strip()
+        if not text:
+            return ""
+        print()
+        print(question_block(text))
+
+        if self.ask_hook is not None:
+            answer = str(self.ask_hook(text) or "").strip()
+            print(answer_echo(answer or "(skipped)"))
+            return answer
+
+        if not sys.stdin.isatty():
+            print(
+                notice(
+                    "warn",
+                    "no terminal to answer on - the question is skipped",
+                    stream=sys.stderr,
+                ),
+                file=sys.stderr,
+            )
+            return ""
+
+        try:
+            return read_line(
+                "  " + paint("answer", "bold", "cyan")
+                + paint(" (blank skips): ", "dim")
+            ).strip()
+        except EOFError:
+            print()
+            return ""
+        # KeyboardInterrupt is deliberately not caught: Ctrl+C at a question
+        # stops the request, exactly as it does at an allow? prompt.
+
+    def tool_ask_user(self, question: str = "") -> str:
+        if not (question or "").strip():
+            raise ToolError("ask_user needs a non-empty question")
+        answer = self.ask_user(question)
+        return answer or ASK_SKIPPED
 
     # -- tool implementations --------------------------------------------- #
 
@@ -3189,6 +3313,7 @@ class Harness:
             "append_file": self.tool_append_file,
             "delete_file": self.tool_delete_file,
             "execute_command": self.tool_execute_command,
+            "ask_user": self.tool_ask_user,
         }
         # delete_file is not advertised in tester mode, but an older
         # conversation or a hand-written call can still name it: the method
@@ -4137,7 +4262,8 @@ def run_selftest() -> int:
             assert "delete_file" not in tester_names, tester_names
             assert len(tester_names) == len(coder_names) - 1, tester_names
             for expected in ("list_files", "search_files", "read_file",
-                             "write_file", "append_file", "execute_command"):
+                             "write_file", "append_file", "execute_command",
+                             "ask_user"):
                 assert expected in tester_names, tester_names
             # The coder descriptions must survive the copy untouched.
             coder_write = next(t for t in tools_for(False)
@@ -4149,6 +4275,52 @@ def run_selftest() -> int:
 
         check("the tester tool menu drops delete_file and rewrites the descriptions",
               _tester_tool_menu)
+
+        def _ask_user_round_trip() -> None:
+            local = make_harness()
+            asked: list[str] = []
+
+            def answer(question: str) -> str:
+                asked.append(question)
+                return "postgres, with pooling"
+
+            local.ask_hook = answer
+            printed = _capture(lambda: local.tool_ask_user("Which database?"))
+
+            assert asked == ["Which database?"], asked
+            # The transcript must show both halves, so the window reads like
+            # the conversation the terminal shows.
+            assert "Which database?" in printed, printed
+            assert "postgres, with pooling" in printed, printed
+            assert "\u276f" in printed or ">" in printed, printed
+
+            # A skipped answer is a result for the model, not an error.
+            local.ask_hook = lambda question: ""
+            skipped = local.tool_ask_user("Which database?")
+            assert skipped == ASK_SKIPPED, skipped
+            assert local.dispatch("ask_user", {"question": "Proceed?"}) == ASK_SKIPPED
+
+            expect_error(lambda: local.tool_ask_user("   "), "question")
+
+        check("ask_user returns the typed answer and reports a skip",
+              _ask_user_round_trip)
+
+        def _ask_user_without_a_terminal() -> None:
+            local = make_harness()
+            real_stdin = sys.stdin
+            sys.stdin = io.StringIO()            # isatty() is False
+            try:
+                result: list[str] = []
+                printed = _capture(
+                    lambda: result.append(local.tool_ask_user("Continue?"))
+                )
+            finally:
+                sys.stdin = real_stdin
+            assert result == [ASK_SKIPPED], result
+            assert "Continue?" in printed, printed
+
+        check("ask_user skips instead of blocking when no terminal is attached",
+              _ask_user_without_a_terminal)
 
         def _tester_prompt_and_harness() -> None:
             tester = make_harness(tester=True)
