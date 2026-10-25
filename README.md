@@ -63,7 +63,8 @@ tester run cannot damage the code it is reviewing even if the model tries.
 ### The handover file
 
 Both modes talk through `.harness_sessions/Testing.md`, a plain Markdown file
-with a `Status:` line at the top and an append-only log underneath:
+with a `Status:` line at the top, the current round's handover, and a test log
+underneath:
 
 | Status | What the tester does |
 |--------|----------------------|
@@ -76,8 +77,14 @@ with a `Status:` line at the top and an append-only log underneath:
 
 The developer writes the criteria and the exact verification commands, self-tests
 first, and stops. The tester reproduces those commands, probes the edges, and
-appends a numbered defect list plus one of those statuses. The log is never
-rewritten, so it doubles as the audit trail of what was fixed between rounds.
+appends a numbered defect list plus one of those statuses. That append is the
+only write the tester makes.
+
+The developer's next round then **replaces the file** rather than appending to
+it, so the file always describes exactly one round and it is never ambiguous
+which block is current. The tester's verdict and defect IDs are carried forward
+into a *Previous round* section at the top of the new handover, which is what
+keeps the loop traceable across overwrites.
 
 ### Using it
 
@@ -101,7 +108,8 @@ The tester is told to read the status line first, so a run against `PASSED` or
 alone — a developer that marks its own work `PASSED` has broken the loop.
 
 Both modes work in the [desktop window](#desktop-window) too:
-`python3 uharness-ui.py --tester` shows the same `U · T E S T E R` panel.
+`python3 uharness-ui.py --tester` shows the same `U · T E S T E R` panel, and
+*Agent → Tester mode* switches role without restarting the window.
 
 ---
 
@@ -446,7 +454,7 @@ uharness
 Inside an interactive session:
 
 ```
-you> @{always-be-funny} summarise what this repository does
+you> @{test-manager} where do things stand?
 you> now write that summary to README.md
 you> /save myapp-summary
 you> /exit
@@ -747,14 +755,18 @@ command works when typed into the prompt box, exactly as in the terminal. An
 unknown slash command still only prints a warning and never reaches the model.
 With `--tester` the window shows the `U · T E S T E R` panel and the same
 report-only fence: the code stays read-only, and the report is the one writable
-file.
+file. The role is not fixed at startup — *Agent → Tester mode (writes only the
+report)* flips it while the window is open. The tool menu, the system prompt and
+the write fence change with it, the footer grows a `· tester` badge, and the
+conversation is kept; only the system turn is rebuilt. The checkbox is refused
+while a request is running, so the tool menu cannot change under a live turn.
 
 The menu bar mirrors those commands, so nothing has to be memorised:
 
 | Menu | What is in it |
 |------|---------------|
 | **File** | Save conversation (Ctrl+S), open one (Ctrl+O), list them, export the feedback pane, quit (Ctrl+Q) |
-| **Agent** | Auto-approve, dry run, thinking mode, token usage, verbosity, free/paid model, show the model in use |
+| **Agent** | Auto-approve, dry run, tester mode, thinking mode, token usage, verbosity, free/paid model, show the model in use |
 | **Conversation** | Forget the conversation, show context size, change workspace |
 | **Skills** | List the skills available to this agent, refresh the skill index |
 | **Tools** | Run the offline self-test |
@@ -795,7 +807,7 @@ Two forms are supported, and both can be mixed in the same folder:
 
 ```
 skills/
-├── always-be-funny/
+├── my-skill/
 │   └── SKILL.md          # a folder, free to carry extra reference files
 └── concise.md            # or a single file
 ```
@@ -1084,7 +1096,7 @@ need to observe a non-interactive denial.
 
 ```
 uharness                  Launcher script. Runs the agent in your cwd.
-uharness.py               The entire agent. Single file, ~5,650 lines. Coder
+uharness.py               The entire agent. Single file, ~5,700 lines. Coder
                           by default, tester with --tester.
 uharness-ui.py            tkinter front-end: same agent, in a window.
 uharness-ui-launcher      Shell launcher behind the desktop icon / PATH command.
@@ -1092,13 +1104,11 @@ uharness-ui.desktop       Application-grid entry (template; see the installer).
 uharness-ui.svg           The icon, scalable.
 install-launcher.sh       Installs the three above under ~/.local (and removes).
 skills/                   Skill packs, searched from every workspace.
-├── always-be-funny/
-│   └── SKILL.md          Example skill.
 ├── handover-to-tester/
 │   ├── SKILL.md          Developer side of the dev -> tester loop.
 │   └── Testing.template.md  Shape for .harness_sessions/Testing.md.
-└── test/
-    └── SKILL.md          Example skill: inventory a folder into report.md.
+└── test-manager/
+    └── SKILL.md          Reads the tester's verdict back out of Testing.md.
 .harness_sessions/        Autosaved conversations, written as you chat.
 .gitignore
 LICENSE                   Apache License 2.0 - the terms this project ships under.

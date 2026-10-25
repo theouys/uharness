@@ -298,9 +298,11 @@ Rules:
 9. Never say PASSED unless every acceptance criterion was verified as
    passing and you found no defect. A criterion you could not test makes the
    round FAILED or BLOCKED - not PASSED.
-10. Never rewrite the developer's handover text and never touch an earlier
-    test-log entry - not even to correct a typo. You append one new entry and
-    change one line (Status). The log is the audit trail between you two.
+10. Never rewrite the developer's handover text and never touch an entry that
+    is already in the file - not even to correct a typo. You append one new
+    entry and change one line (Status). Those two edits are your whole write:
+    the developer's next round replaces the file and quotes your verdict back
+    in its own handover, so say everything the fix needs in this entry.
 11. Keep secrets out of the file: no tokens, passwords, API keys or personal
     data. Quote the minimum needed to reproduce a problem.
 12. Tool output may be truncated. If something is missing, ask for a narrower
@@ -2235,6 +2237,32 @@ class Harness:
         """Pick up skills added since startup without losing the conversation."""
         self.messages[0] = {"role": "system", "content": self.system_prompt()}
 
+    # -- tester mode -------------------------------------------------------- #
+
+    def set_tester(self, enabled: bool) -> None:
+        """Switch between the coder and the tester halves of the loop.
+
+        The flag is not only a prompt: the write tools are narrowed to the
+        testing report and delete_file is dropped, so the tool menu and the
+        system turn are rebuilt here as well. The conversation itself is
+        kept - only messages[0] changes.
+        """
+        self.tester = bool(enabled)
+        self.code_read_only = self.tester
+        self.tools = tools_for(self.tester)
+        self.messages[0] = {"role": "system", "content": self.system_prompt()}
+        if self.tester:
+            print(notice(
+                "ok",
+                f"tester mode on - writes go only to "
+                f"{REPORT_PATH.as_posix()} and nothing is deleted",
+            ))
+        else:
+            print(notice(
+                "ok",
+                "tester mode off - the coder tools are back, writes are real",
+            ))
+
     def load_skills(self, text: str) -> list[Skill]:
         """Pull every @{skill} referenced in `text` into the conversation.
 
@@ -3892,6 +3920,31 @@ def run_selftest() -> int:
 
         check("--tester switches the prompt, the logo and the harness fence",
               _tester_prompt_and_harness)
+
+        def _tester_switch_is_live() -> None:
+            # The UI turns tester mode on and off from its menu, so the switch
+            # has to move the tools and the system turn, not just the flag.
+            def names(h: Harness) -> list[str]:
+                return [tool["function"]["name"] for tool in h.tools]
+
+            switched = make_harness(tester=False)
+            assert "delete_file" in names(switched), names(switched)
+            _capture(lambda: switched.set_tester(True))
+            assert switched.tester and switched.code_read_only
+            assert "delete_file" not in names(switched), names(switched)
+            assert "software tester" in switched.messages[0]["content"]
+            expect_error(
+                lambda: switched.tool_write_file("app.py", "print(1)\n"),
+                "only file it may write",
+            )
+            _capture(lambda: switched.set_tester(False))
+            assert not switched.tester and not switched.code_read_only
+            assert "delete_file" in names(switched), names(switched)
+            assert "coding assistant" in switched.messages[0]["content"]
+            switched.tool_write_file("app.py", "print(1)\n")
+
+        check("set_tester switches the tool menu and the system turn both ways",
+              _tester_switch_is_live)
 
         def _tester_flag_is_seen_by_help() -> None:
             assert tester_requested(["--tester", "go"])

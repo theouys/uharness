@@ -7,8 +7,8 @@ command also lives in the menu bar:
 
     File          Save conversation (Ctrl+S), open one (Ctrl+O), list them,
                   export what the pane is showing, quit
-    Agent         auto-approve, dry run, thinking mode, token usage, verbosity,
-                  free/paid model, show the model in use
+    Agent         auto-approve, dry run, tester mode, thinking mode, token
+                  usage, verbosity, free/paid model, show the model in use
     Conversation  forget the conversation, show the context size,
                   change the workspace
     Skills        list the skills available to this agent
@@ -459,6 +459,12 @@ class HarnessUI:
         if not path.is_dir():
             raise ValueError(f"workspace is not a directory: {path}")
 
+        # The menu can change role while the window is open, so a harness built
+        # later (change workspace) keeps the role the window is in rather than
+        # falling back to whatever --tester said at startup.
+        current = getattr(self, "harness", None)
+        tester = self.args.tester if current is None else current.tester
+
         harness = core.Harness(
             path,
             model=self.args.model,
@@ -471,7 +477,7 @@ class HarnessUI:
             log_path=Path(self.args.log).expanduser() if self.args.log else None,
             show_usage=self.args.usage,
             autosave=not self.args.no_autosave,
-            tester=self.args.tester,
+            tester=tester,
         )
         self.install_approver(harness)
         return harness
@@ -600,6 +606,7 @@ class HarnessUI:
         # The menu items below read and write these, so they exist first.
         self.var_approve = tk.BooleanVar(value=self.harness.auto_approve)
         self.var_dry = tk.BooleanVar(value=self.harness.dry_run)
+        self.var_tester = tk.BooleanVar(value=self.harness.tester)
         self.var_thinking = tk.BooleanVar(value=self.harness.thinking)
         self.var_usage = tk.BooleanVar(value=self.harness.show_usage)
         self.var_verbosity = tk.StringVar(value=self.harness.verbosity)
@@ -631,6 +638,8 @@ class HarnessUI:
                                    command=self.toggle_approve)
         agent_menu.add_checkbutton(label="Dry run (change nothing)",
                                    variable=self.var_dry, command=self.toggle_dry_run)
+        agent_menu.add_checkbutton(label="Tester mode (writes only the report)",
+                                   variable=self.var_tester, command=self.toggle_tester)
         agent_menu.add_checkbutton(label="Thinking / reasoning mode",
                                    variable=self.var_thinking,
                                    command=self.toggle_thinking)
@@ -1211,6 +1220,20 @@ class HarnessUI:
                     if self.harness.dry_run else "dry run off - changes are real")
         self.sync_vars()
 
+    def toggle_tester(self) -> None:
+        """Switch this window between the coder and the tester.
+
+        The harness does the real work (tools, system turn, write fence) and
+        reports it; this only refuses to do it mid-request, because the tool
+        menu must not change under a running turn.
+        """
+        if self.busy:
+            self.notice("warn", "a request is running - wait before switching role")
+            self.sync_vars()      # put the checkbox back where it was
+            return
+        self.harness.set_tester(bool(self.var_tester.get()))
+        self.sync_vars()
+
     def toggle_thinking(self) -> None:
         self.harness.thinking = bool(self.var_thinking.get())
         self.notice("info", "thinking mode on"
@@ -1309,6 +1332,7 @@ class HarnessUI:
                 "U-HARNESS UI - the agent harness, with a window.",
                 "",
                 f"model:      {harness.model} ({'free' if harness.free else 'paid'})",
+                f"role:       {'tester (report only)' if harness.tester else 'developer'}",
                 f"workspace:  {harness.workspace}",
                 f"sessions:   {harness.rel(harness.sessions_dir)}",
                 f"skills:     {harness.skills.describe_roots()}",
@@ -1327,6 +1351,7 @@ class HarnessUI:
         harness = self.harness
         self.var_approve.set(harness.auto_approve)
         self.var_dry.set(harness.dry_run)
+        self.var_tester.set(harness.tester)
         self.var_thinking.set(harness.thinking)
         self.var_usage.set(harness.show_usage)
         self.var_verbosity.set(harness.verbosity)
@@ -1338,7 +1363,8 @@ class HarnessUI:
             foreground=GREEN if harness.free else YELLOW,
         )
         approval = "auto-approve" if harness.auto_approve else "ask first"
-        extra = " \u00b7 dry run" if harness.dry_run else ""
+        extra = " \u00b7 tester" if harness.tester else ""
+        extra += " \u00b7 dry run" if harness.dry_run else ""
         extra += " \u00b7 thinking" if harness.thinking else ""
         self.footer.configure(
             text=(f"{harness.workspace}   |   {harness.verbosity} \u00b7 {approval}"

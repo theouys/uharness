@@ -1,6 +1,6 @@
 ---
 name: handover to tester
-description: Finish a development task, prove it actually works, then hand it to a separate testing agent by writing .harness_sessions/Testing.md - and stop working until the tester replies.
+description: Finish a development task, prove it actually works, then hand it to a separate testing agent by writing .harness_sessions/Testing.md - the whole file, replaced fresh each round - and stop working until the tester replies.
 ---
 
 # Handover to Tester - Developer Side
@@ -15,15 +15,26 @@ you develop + self-test
         |
         v
 .harness_sessions/Testing.md   status: READY FOR TESTING
+        (the whole file, written fresh)
         |
         v
-   tester reads, tests, appends
+   tester reads, tests, appends its result
         |
         +-- status: PASSED  -> you report it and STOP. The job is done.
         |
-        +-- status: FAILED  -> the log is your bug list. Fix, new round,
-                               status: READY FOR TESTING again.
+        +-- status: FAILED  -> their findings are your bug list. Fix,
+                               self-test, then OVERWRITE the file with
+                               the next round: status READY FOR TESTING.
 ```
+
+One file, two write moves, one per side:
+
+- **You replace the file.** Every handover you write is the *whole* file -
+  Round 1 creates it, every later round overwrites it. Nothing is appended, so
+  the file always describes exactly one round and never stacks up.
+- **The tester appends its result** under the log heading and changes the
+  `Status` line. That entry is the thing you read before your next round, and
+  the thing your overwrite replaces - so carry its essentials forward (Step 4).
 
 ## When this skill applies
 
@@ -43,12 +54,17 @@ its `Status` decide your job:
 | file missing | New job. Develop, self-test, write the handover as Round 1. |
 | `READY FOR TESTING` | Already handed over. Do **not** edit it and do **not** start new work. Tell the user it is waiting on the tester. |
 | `PASSED` | Report it in chat and **stop**. No new development. Only start a new round if the user asks for a *new* change. |
-| `FAILED` | The tester's log entries are your task list. Fix them, self-test, then write the next round (`READY FOR TESTING`). |
+| `FAILED` | The tester's findings are your task list. Read them, fix them, self-test, then **overwrite** the file with the next round (`READY FOR TESTING`) - carrying a short summary of what was reported. |
 | `BLOCKED` | Read why. Either remove the blocker, or ask the user - do not guess around a missing dependency. |
-| `WITHDRAWN` | Your own earlier handover was pulled. Read your withdrawal note, then re-hand-over as a new round when it is genuinely ready. |
+| `WITHDRAWN` | Your own earlier handover was pulled. Read the note, then re-hand-over as a new round by **overwriting** the file when it is genuinely ready. |
 
 Reading this file is cheap. Skipping it means you either redo work the tester
 already accepted or you build on top of a failure nobody read.
+
+When you overwrite a `FAILED` round, first take what you need out of the tester's
+entry - verdict, defect IDs, the criteria that failed - and put it in the
+`Previous round` section of the new handover. Your overwrite is what deletes
+their words; the summary is how the fix stays traceable.
 
 ## Step 2 - Develop
 
@@ -79,10 +95,18 @@ Write `.harness_sessions/Testing.md` inside the workspace root. Create
 `.harness_sessions/` if it does not exist - it is the same folder `/save` uses.
 `Testing.template.md` next to this skill has the exact shape to copy.
 
+**Write the whole file every round, with `write_file`. Never append a round onto
+the tester's entry.** Round 1 creates the file; every later round replaces it.
+The previous round is gone afterwards, so the new file must be complete on its
+own.
+
 Use the template's sections in order:
 
 - **Status / Round / Date / Summary** - the tester reads the first line to know
   whether it has work to do at all.
+- **Previous round** - from Round 2 on: the tester's verdict, the defect IDs it
+  reported, and one line each on what you changed in response. This is the only
+  thing that survives your overwrite, so it is what keeps the loop traceable.
 - **What changed** - every file with its path and one line on what it does now.
 - **Acceptance criteria** - numbered, observable, independently checkable. "A
   POST to `/login` with a bad password returns 401 and logs one warning" is a
@@ -91,16 +115,24 @@ Use the template's sections in order:
   reproduces your run instead of inventing a new one.
 - **Not tested / out of scope** - the honest gaps, plus what you deliberately
   did not attempt.
-- **Test log** - append-only, newest entry last.
+- **Test log** - this round's own `Round N handover` entry, nothing older. The
+  tester appends its result under it.
 
 Editing rules for the file:
 
-- **Each round rewrites the handover block, never the log.** The status
-  summary, criteria, verification steps and scope describe *this* round and get
-  replaced. The log is history: append a `Round N handover` entry and leave every
-  earlier entry - yours and the tester's - untouched.
-- **Never edit the tester's entries.** If you disagree with a failure, add your
-  own entry below it that says what you changed; do not rewrite their words.
+- **Replace the file, never grow it.** Use `write_file` with the complete new
+  handover. `append_file` is the tester's move, not yours: an appended second
+  round leaves two blocks in one file and the tester cannot tell which one is
+  current.
+- **Read before you overwrite.** Never write the file while its status is
+  `READY FOR TESTING` - the tester may be running. Overwrite only after you have
+  the result in front of you and the fix is done and self-tested.
+- **Carry the tester's findings forward in your own words.** Quote the verdict,
+  keep their defect IDs (D1, D2, ...) so a fix maps to a report, and say what you
+  did about each. Do not drop a defect silently - if you disagree, say why in the
+  new round instead of deleting the disagreement.
+- **Never write a round in the tester's voice.** You do not write verdicts, you
+  do not mark criteria as passed on their behalf, and you never set `PASSED`.
 - **Keep it readable in one screen or two.** Around 150 lines is the ceiling.
   Bind detail to code paths rather than pasting files in.
 - **No secrets, tokens, passwords, API keys or personal data** in the file. It
@@ -118,19 +150,23 @@ After the file is written:
    different agent in a different session - the file is the only handshake.
 
 If the user asks for more work while the status is `READY FOR TESTING`, they are
-changing a target the tester is about to test: say so, and either fold the
-change in and re-hand-over, or wait. Never leave the file claiming to describe
-code that has since moved.
+changing a target the tester is about to test: say so, and either fold the change
+in and re-hand-over (overwrite the whole file with the updated round) or wait.
+Never leave the file claiming to describe code that has since moved.
 
 ## Withdrawing a handover
 
 If you find, after writing, that the handover is wrong or the code is broken:
 
-- **append** a `WITHDRAWN` log entry stating what is wrong and why;
-- set `Status: WITHDRAWN` in the header;
-- fix it, then re-hand-over as the next round.
+- **overwrite** the file with the same handover, `Status: WITHDRAWN` in the
+  header, and a short note saying what is wrong and why;
+- keep the round number - the withdrawn file is still that round;
+- fix it, then overwrite again with the next round, `READY FOR TESTING`.
 
-Never quietly edit away a handover the tester may already be reading.
+Never quietly edit away a handover the tester may already be reading: the
+`WITHDRAWN` status is the signal. The exception is the ordinary next round -
+once the tester's result is in the file and you are re-handing-over, replacing
+the file is exactly the intended move.
 
 ## Failure modes this skill exists to prevent
 
@@ -138,10 +174,12 @@ Never quietly edit away a handover the tester may already be reading.
 |------------|--------------|
 | Writing the handover before testing | The tester spends a session rediscovering your bug. |
 | "Tests pass" with no command or output | Unverifiable claim; the tester has to redo it from zero. |
-| Overwriting the log each round | Destroys the tester's findings and the audit trail of what was fixed. |
+| Appending round 2 under the tester's entry | The file holds two rounds at once; the tester cannot tell which block is current. |
+| Overwriting before reading the tester's entry | Their defect list is deleted and the same bugs come back with new numbers. |
+| Overwriting while the status is `READY FOR TESTING` | You clobber a handover the tester is testing right now. |
 | Marking the file `PASSED` yourself | Ends the loop on an untested claim. Only the tester passes work. |
 | Keeping to develop after handover | The tester tests a moving target, and the file lies about the code. |
-| A handover per tiny edit | Log noise; the tester cannot tell what is actually up for review. |
+| A handover per tiny edit | Round numbers pile up; the tester cannot tell what is actually up for review. |
 
 ## Chat summary shape
 
