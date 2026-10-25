@@ -88,6 +88,14 @@ BLUE = "#8ab4f8"
 ANSWER = "#add8e6"      # light blue: the model's final answer, not commentary
 SEP = "#4a4f57"
 
+# The badge colour per model tier, matching the terminal's green/yellow/
+# magenta so the two interfaces say the same thing in the same colours.
+TIER_COLOURS: dict[str, str] = {
+    "free": GREEN,
+    "paid": YELLOW,
+    "gemma": MAGENTA,
+}
+
 TAG_COLOURS: dict[str, dict[str, Any]] = {
     "body": {"foreground": FG},
     "dim": {"foreground": DIM},
@@ -700,7 +708,7 @@ class HarnessUI:
         self.var_thinking = tk.BooleanVar(value=self.harness.thinking)
         self.var_usage = tk.BooleanVar(value=self.harness.show_usage)
         self.var_verbosity = tk.StringVar(value=self.harness.verbosity)
-        self.var_tier = tk.StringVar(value="free" if self.harness.free else "paid")
+        self.var_tier = tk.StringVar(value=self.harness.tier)
 
         menu = tk.Menu(self.root)
         self.root.configure(menu=menu)
@@ -752,6 +760,9 @@ class HarnessUI:
         model_menu.add_radiobutton(label="Paid (DeepSeek)", value="paid",
                                    variable=self.var_tier,
                                    command=lambda: self.command("/model paid"))
+        model_menu.add_radiobutton(label="Gemma 4 (Google AI Studio)",
+                                   value="gemma", variable=self.var_tier,
+                                   command=lambda: self.command("/model gemma"))
         agent_menu.add_cascade(label="Model", menu=model_menu)
         agent_menu.add_command(label="Show current model",
                                command=lambda: self.command("/model"))
@@ -1210,10 +1221,11 @@ class HarnessUI:
         elif word in {"/context", "/ctx"}:
             core.show_context(self.harness)
         elif word == "/model":
-            if argument in {"free", "paid"}:
-                self.set_model(argument == "free")
+            if argument in core.TIER_PROFILES:
+                self.set_model(argument)
             elif argument:
-                self.notice("warn", "usage: /model [free|paid]")
+                self.notice("warn", "usage: /model "
+                            + "|".join(core.TIER_ORDER))
             else:
                 self.show_model()
         elif word in {"/approve", "/auto"}:
@@ -1333,9 +1345,9 @@ class HarnessUI:
             return
         core.show_undo(self.harness, argument)
 
-    def set_model(self, free: bool) -> None:
+    def set_model(self, tier: str) -> None:
         try:
-            self.harness.set_free(free)
+            self.harness.set_tier(tier)
         except ValueError as exc:
             self.notice("error", f"cannot switch: {exc}")
         self.sync_vars()
@@ -1474,7 +1486,7 @@ class HarnessUI:
             "\n".join([
                 "U-HARNESS UI - the agent harness, with a window.",
                 "",
-                f"model:      {harness.model} ({'free' if harness.free else 'paid'})",
+                f"model:      {harness.model} ({harness.tier})",
                 f"context:    {core.context_summary(harness.messages)}",
                 f"role:       {'tester (report only)' if harness.tester else 'developer'}",
                 f"workspace:  {harness.workspace}",
@@ -1499,15 +1511,15 @@ class HarnessUI:
         self.var_thinking.set(harness.thinking)
         self.var_usage.set(harness.show_usage)
         self.var_verbosity.set(harness.verbosity)
-        self.var_tier.set("free" if harness.free else "paid")
+        self.var_tier.set(harness.tier)
 
-        tier = "free" if harness.free else "paid"
+        tier = harness.tier
         # Same shape as the terminal badge: the context size sits next to the
         # model, so the room left in the window is always on screen.
         self.badge.configure(
             text=(f"\u25cf {tier}  {harness.model}"
                   f"  \u00b7 context {core.context_summary(harness.messages)}"),
-            foreground=GREEN if harness.free else YELLOW,
+            foreground=TIER_COLOURS.get(tier, CYAN),
         )
         approval = "auto-approve" if harness.auto_approve else "ask first"
         extra = " \u00b7 tester" if harness.tester else ""
@@ -1526,7 +1538,7 @@ class HarnessUI:
 
         rows: list[tuple[str, str]] = [
             ("model", harness.model),
-            ("profile", "free" if harness.free else "paid"),
+            ("profile", harness.tier),
             ("workspace", str(harness.workspace)),
             ("tools", f"{len(harness.tools)} available"),
         ]

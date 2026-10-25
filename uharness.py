@@ -22,7 +22,9 @@ write is refused, so a tester run cannot damage the code it is reviewing.
 
 Requirements:
     pip install openai
-    export TOKENHARBOR_API_KEY="thk_live_..."   # previously: DEEPSEEK_API_KEY
+    export TOKENHARBOR_API_KEY="thk_live_..."   # free tier (the default)
+    export DEEPSEEK_API_KEY="sk-..."            # paid tier
+    export GEMMA_API_KEY="AQ..."                # gemma tier (Gemma 4)
 
 Examples (coder):
     python3 uharness.py "Create a Flask hello-world app in app.py"
@@ -42,8 +44,9 @@ Examples (tester):
 
 In the interactive session, /save [name] stores the conversation in
 .harness_sessions/ and /open brings one back to carry on where you stopped.
-/model shows the model in use; /model free and /model paid switch between
-the free Token Harbor model and the paid DeepSeek model.
+/model shows the model in use; /model free, /model paid and /model gemma switch
+between the free Token Harbor model, the paid DeepSeek model and Gemma 4 on
+Google AI Studio (GEMMA_API_KEY, or GEMINI_API_KEY / GOOGLE_API_KEY).
 
 Skills are reusable instruction packs. Type @{skill-name} anywhere in a prompt
 and that skill's text is dropped into the context just before the request;
@@ -107,8 +110,13 @@ except ImportError:  # pragma: no cover
 DEFAULT_MODEL = os.environ.get("TOKENHARBOR_MODEL", "deepseek-v4.1-flash:free")
 BASE_URL = os.environ.get("TOKENHARBOR_BASE_URL", "https://tokenharbor.ai/v1")
 
-# The /model command swaps between these two profiles at runtime.
-# "paid" is the original DeepSeek endpoint; "free" is the Token Harbor tier.
+# The /model command swaps between these profiles at runtime. Each tier is a
+# (model, base_url, key env var) triple, so adding a provider is one entry
+# here plus its name in TIER_ORDER - nothing else in the harness assumes there
+# are exactly two.
+#   free  - Token Harbor, the default
+#   paid  - DeepSeek's own endpoint
+#   gemma - Google AI Studio's OpenAI-compatible endpoint (Gemma 4)
 PAID_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 PAID_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 PAID_API_KEY_ENV = "DEEPSEEK_API_KEY"
@@ -116,6 +124,27 @@ PAID_API_KEY_ENV = "DEEPSEEK_API_KEY"
 FREE_MODEL = DEFAULT_MODEL
 FREE_BASE_URL = BASE_URL
 FREE_API_KEY_ENV = "TOKENHARBOR_API_KEY"
+
+# Gemma 4 through AI Studio's OpenAI-compatible layer, so the same openai
+# client and the same tool schema work unchanged. GEMMA_MODEL can name either
+# served model: gemma-4-26b-a4b-it (4B active parameters, the faster one) or
+# gemma-4-31b-it. Google names the key GEMINI_API_KEY in its own docs and
+# GOOGLE_API_KEY elsewhere, so all three spellings are accepted, in that order.
+GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma-4-26b-a4b-it")
+GEMMA_BASE_URL = os.environ.get(
+    "GEMMA_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+GEMMA_API_KEY_ENVS = ("GEMMA_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+# Order matters twice: it is the order /model lists the tiers in, and the
+# order _infer_tier() tries when the model name does not name a tier.
+TIER_ORDER = ("free", "paid", "gemma")
+
+TIER_PROFILES: dict[str, tuple[str, str, tuple[str, ...]]] = {
+    "free": (FREE_MODEL, FREE_BASE_URL, (FREE_API_KEY_ENV,)),
+    "paid": (PAID_MODEL, PAID_BASE_URL, (PAID_API_KEY_ENV,)),
+    "gemma": (GEMMA_MODEL, GEMMA_BASE_URL, GEMMA_API_KEY_ENVS),
+}
 
 MAX_TOOL_OUTPUT = 30_000       # characters fed back to the model per tool call
 MAX_FILE_CONTENT = 60_000      # characters read from one file
@@ -1224,20 +1253,21 @@ def answer_echo(answer: str, stream: Any = None) -> str:
 
 
 def tier_badge(harness: Harness, stream: Any = None) -> str:
-    """The "free"/"paid" line that sits above the prompt.
+    """The tier line that sits above the prompt.
 
     One dim line so the tier in use is always visible: "free  deepseek-v4.1-
-    flash:free" or "paid  deepseek-flash". The colour is the point - green for
-    the free tier, yellow for paid - so a glance is enough. The context size
-    rides on the same line, so how much of the window the conversation has
-    used is visible without typing /context:
+    flash:free", "paid  deepseek-flash" or "gemma  gemma-4-26b-a4b-it". The
+    colour is the point - green for the free tier, yellow for paid, magenta for
+    gemma - so a glance is enough. The context size rides on the same line, so
+    how much of the window the conversation has used is visible without
+    typing /context:
 
         ● free  deepseek-v4.1-flash:free  • context 3.4k/100k tokens (3%)
     """
-    if harness.free:
-        label, colour = "free", "green"
-    else:
-        label, colour = "paid", "yellow"
+    label = harness.tier
+    colour = {"free": "green", "paid": "yellow", "gemma": "magenta"}.get(
+        label, "cyan",
+    )
     g = glyphs(stream)
     head = (
         "  " + paint(g["bullet"], colour, stream=stream)
@@ -2456,9 +2486,12 @@ class Harness:
         # created lazily, so a turn that changes nothing leaves no directory.
         self._undo_group: Path | None = None
         self._undo_warned = False
-        # Which profile the client is currently built from ("free" or "paid").
+        # Which tier the client is currently built from ("free", "paid" or
+        # "gemma"). requested_model is the -m name as given, kept so a tier
+        # switch can tell "the tier default" from "a model the user named".
         self.api_key = api_key
-        self.free = self._infer_free()
+        self.requested_model = model
+        self.tier = self._infer_tier()
         self.client = self._build_client()
         # The desktop window sets this to a callable that puts a question in
         # its own dialog and returns the text typed there. None means "use the
@@ -2493,52 +2526,108 @@ class Harness:
             shown = "tool headline only (warnings and errors still shown)"
         print(notice("ok", f"verbosity {level} - {shown}"))
 
-    # -- paid / free profiles ---------------------------------------------- #
+    # -- model tiers -------------------------------------------------------- #
 
-    def _infer_free(self) -> bool:
+    @property
+    def free(self) -> bool:
+        """True when the free tier is in use.
+
+        Kept because the display layer asks the simple question far more often
+        than the specific one; self.tier is the real state.
+        """
+        return self.tier == "free"
+
+    @staticmethod
+    def _tier_of_model(model: str) -> str | None:
+        """Which tier a model name belongs to, or None for an unknown name.
+
+        Used so -m gemma-4-31b-it picks the Gemma tier on its own, without a
+        separate flag: the name is the strongest hint about which endpoint can
+        serve it.
+        """
+        name = model.strip().lower()
+        if name == PAID_MODEL.lower():
+            return "paid"
+        if name == FREE_MODEL.lower() or name.endswith(":free"):
+            return "free"
+        if name.startswith("gemma") or name.startswith("models/gemma"):
+            return "gemma"
+        return None
+
+    @staticmethod
+    def _key_for(tier: str) -> str:
+        """The first API key set for this tier, or "" when none is."""
+        for env in TIER_PROFILES[tier][2]:
+            value = os.environ.get(env)
+            if value:
+                return value
+        return ""
+
+    def _infer_tier(self) -> str:
         """Decide the startup tier from the model name, then the keys present.
 
-        An explicitly chosen paid model starts paid, and an explicit free-tier
-        model (one ending in ":free") starts free. When the model is left at
-        the default, prefer whichever tier actually has a key set.
+        An explicit model name wins: a ":free" model starts free, a gemma-*
+        model starts on the Gemma tier, and the paid model starts paid. When
+        the model is left at the default, prefer whichever tier actually has a
+        key set, so a machine with only one key still starts working.
         """
         if self.model == DEFAULT_MODEL:
-            has_free = bool(os.environ.get(FREE_API_KEY_ENV))
-            has_paid = bool(os.environ.get(PAID_API_KEY_ENV))
-            # Prefer the tier that has a key set; free is the fallback.
-            return not (has_paid and not has_free)
-        return self.model == FREE_MODEL or self.model.endswith(":free")
+            for tier in TIER_ORDER:
+                if self._key_for(tier):
+                    return tier
+            return "free"
+        return self._tier_of_model(self.model) or next(
+            (tier for tier in TIER_ORDER if self._key_for(tier)), "free",
+        )
 
-    def _profile(self, free: bool) -> tuple[str, str, str]:
-        """Return (model, base_url, api_key) for the chosen tier."""
-        if free:
-            key = self.api_key or os.environ.get(FREE_API_KEY_ENV)
-            return FREE_MODEL, FREE_BASE_URL, key
-        key = self.api_key or os.environ.get(PAID_API_KEY_ENV)
-        return PAID_MODEL, PAID_BASE_URL, key
+    def _profile(self, tier: str) -> tuple[str, str, str]:
+        """Return (model, base_url, api_key) for the chosen tier.
+
+        A model name that belongs to the tier is kept rather than replaced, so
+        -m gemma-4-31b-it stays on the 31b model instead of being bumped back
+        to the tier default.
+        """
+        model, base_url, envs = TIER_PROFILES[tier]
+        if self._tier_of_model(self.requested_model) == tier:
+            model = self.requested_model
+        key = self.api_key
+        if not key:
+            key = next((os.environ.get(env) for env in envs
+                        if os.environ.get(env)), "")
+        return model, base_url, key
 
     def _build_client(self) -> OpenAI:
-        model, base_url, key = self._profile(self.free)
+        model, base_url, key = self._profile(self.tier)
         self.model = model
         return OpenAI(api_key=key or "not-set", base_url=base_url)
 
-    def set_free(self, enabled: bool) -> None:
-        """Swap the client between the free and paid profiles."""
-        free = bool(enabled)
-        model, base_url, key = self._profile(free)
-        if not key:
-            env = FREE_API_KEY_ENV if free else PAID_API_KEY_ENV
+    def set_tier(self, tier: str) -> None:
+        """Swap the client to another tier ("free", "paid" or "gemma")."""
+        tier = tier.strip().lower()
+        if tier not in TIER_PROFILES:
             raise ValueError(
-                f"{env} is not set - export it, then try /model "
-                f"{'free' if free else 'paid'} again"
+                f"unknown tier {tier!r} - /model takes "
+                + ", ".join(TIER_ORDER)
             )
-        self.free = free
+        # Re-read the model name for the tier we are leaving, so switching
+        # away and back does not lose a -m override.
+        model, base_url, key = self._profile(tier)
+        if not key:
+            envs = TIER_PROFILES[tier][2]
+            raise ValueError(
+                f"{' or '.join(envs)} is not set - export it, then try "
+                f"/model {tier} again"
+            )
+        self.tier = tier
         self.client = self._build_client()
-        tier = "free" if self.free else "paid"
         print(notice(
             "ok",
             f"now using the {tier} model: {model} at {base_url}",
         ))
+
+    def set_free(self, enabled: bool) -> None:
+        """Swap between free and paid - the two-tier shorthand for set_tier."""
+        self.set_tier("free" if enabled else "paid")
 
     # -- skills ------------------------------------------------------------ #
 
@@ -3415,8 +3504,11 @@ class Harness:
             kwargs["tools"] = self.tools
             kwargs["tool_choice"] = "auto"
         if self.thinking:
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-            kwargs["reasoning_effort"] = "high"
+            # The thinking switch is a DeepSeek/Token Harbor extra; Gemma 4
+            # reasons on its own and AI Studio rejects the extra_body.
+            if self.tier != "gemma":
+                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+                kwargs["reasoning_effort"] = "high"
 
         last_error: Exception | None = None
         for attempt in range(1, 4):
@@ -5098,6 +5190,107 @@ def run_selftest() -> int:
 
         check("the model line carries the context size", _context_on_the_model_line)
 
+        # -- model tiers -----------------------------------------------------
+        def _tier_from_the_model_name() -> None:
+            # The name is the strongest hint: it decides the tier on its own,
+            # so no extra flag is needed to reach Gemma.
+            assert TIER_ORDER == ("free", "paid", "gemma"), TIER_ORDER
+            assert Harness._tier_of_model(GEMMA_MODEL) == "gemma"
+            assert Harness._tier_of_model("gemma-4-31b-it") == "gemma"
+            assert Harness._tier_of_model("models/gemma-4-31b-it") == "gemma"
+            assert Harness._tier_of_model(PAID_MODEL) == "paid"
+            assert Harness._tier_of_model(FREE_MODEL) == "free"
+            assert Harness._tier_of_model("something-else:free") == "free"
+            assert Harness._tier_of_model("mystery-model") is None
+
+            # A gemma name starts on the gemma tier, and the name is kept
+            # rather than replaced by the tier default - so -m can pick the
+            # 31b model and get the 31b model.
+            gemma = make_harness(model="gemma-4-31b-it")
+            assert gemma.tier == "gemma", gemma.tier
+            assert gemma.model == "gemma-4-31b-it", gemma.model
+            model, base_url, _key = gemma._profile("gemma")
+            assert model == "gemma-4-31b-it", model
+            assert base_url == GEMMA_BASE_URL, base_url
+            assert not gemma.free
+
+            # The default model still starts on the free tier.
+            assert make_harness().tier == "free"
+
+            # Leaving a tier and coming back keeps the -m override.
+            switcher = make_harness(model="gemma-4-31b-it")
+            switcher.tier = "free"
+            switcher.client = switcher._build_client()
+            assert switcher.model == FREE_MODEL, switcher.model
+            switcher.set_tier("gemma")
+            assert switcher.model == "gemma-4-31b-it", switcher.model
+
+            # An unknown tier is refused, and the message lists the real ones.
+            def expect_value_error(fn: collections.abc.Callable[[], Any],
+                                   needle: str) -> None:
+                try:
+                    fn()
+                except ValueError as exc:
+                    assert needle.lower() in str(exc).lower(), str(exc)
+                else:
+                    raise AssertionError(f"expected ValueError with {needle!r}")
+
+            expect_value_error(lambda: switcher.set_tier("nonsense"),
+                               "unknown tier")
+            # A tier with no key says which variable to export. A harness built
+            # without an explicit key falls back to the environment, so the
+            # check clears the Gemma names to see that message.
+            keyless = make_harness(api_key=None)
+            keyless.tier = "gemma"
+            saved = {env: os.environ.pop(env, None) for env in GEMMA_API_KEY_ENVS}
+            try:
+                expect_value_error(lambda: keyless.set_tier("gemma"),
+                                   "GEMMA_API_KEY")
+            finally:
+                for env, value in saved.items():
+                    if value is not None:
+                        os.environ[env] = value
+
+        check("a gemma-* model name selects the gemma tier by itself",
+              _tier_from_the_model_name)
+
+        def _tier_badge_names_the_tier() -> None:
+            for tier, label in (("free", "free"), ("paid", "paid"),
+                                ("gemma", "gemma")):
+                badge_harness = make_harness()
+                badge_harness.tier = tier
+                line = strip_ansi(tier_badge(badge_harness, stream=io.StringIO()))
+                assert f" {label} " in line, (tier, line)
+
+        check("the model line names the tier in use", _tier_badge_names_the_tier)
+
+        def _gemma_gets_no_deepseek_extras() -> None:
+            # The thinking switch is a DeepSeek/Token Harbor extra; sending it
+            # to AI Studio is an error, so _chat must leave it out for gemma.
+            seen: list[dict[str, Any]] = []
+
+            class _Stub:
+                class chat:
+                    class completions:
+                        @staticmethod
+                        def create(**kwargs: Any) -> Any:
+                            seen.append(kwargs)
+                            return object()
+
+            gemma = make_harness(model="gemma-4-31b-it", thinking=True)
+            gemma.client = _Stub()
+            gemma._chat()
+            assert "extra_body" not in seen[-1], seen[-1]
+            assert "reasoning_effort" not in seen[-1], seen[-1]
+
+            paid = make_harness(model=PAID_MODEL, thinking=True)
+            paid.client = _Stub()
+            paid._chat()
+            assert seen[-1].get("reasoning_effort") == "high", seen[-1]
+
+        check("gemma is sent no DeepSeek-only thinking extras",
+              _gemma_gets_no_deepseek_extras)
+
         # -- saved conversations --------------------------------------------
         def _session_roundtrip() -> None:
             keeper = make_harness()
@@ -5854,7 +6047,8 @@ def build_parser(tester: bool = False) -> argparse.ArgumentParser:
             "  /sessions           list saved conversations\n"
             "  /skills             list skill names\n"
             + approve_help +
-            "  /model [free|paid]  show the model in use, or switch tier\n"
+            "  /model [free|paid|gemma]\n"
+            "                      show the model in use, or switch tier\n"
             "  /context            show how much context the conversation uses\n"
             "  /verbose [level]    quiet, brief or full - how much result text prints\n"
             "  /reset              forget the current conversation (alias /clear)\n"
@@ -5873,8 +6067,12 @@ def build_parser(tester: bool = False) -> argparse.ArgumentParser:
             "and from the skills/ folder beside this script; /skills lists them,\n"
             "and HARNESS_SKILLS_DIR replaces both folders.\n"
             "\n"
-            "API keys: TOKENHARBOR_API_KEY for the free tier (the default) or\n"
-            "DEEPSEEK_API_KEY for the paid tier; /model switches at runtime.\n"
+            "API keys: TOKENHARBOR_API_KEY for the free tier (the default),\n"
+            "DEEPSEEK_API_KEY for the paid tier, or GEMMA_API_KEY (also\n"
+            "accepted: GEMINI_API_KEY, GOOGLE_API_KEY) for the gemma tier,\n"
+            "which serves Gemma 4 from Google AI Studio; /model switches at\n"
+            "runtime. A -m name of the form gemma-* selects the gemma tier on\n"
+            "its own, so -m gemma-4-31b-it is enough.\n"
             "\n"
             "The conversation is autosaved after every turn and again on exit,\n"
             "so even a crash leaves /open something to resume from\n"
@@ -5916,8 +6114,10 @@ def build_parser(tester: bool = False) -> argparse.ArgumentParser:
         "-m", "--model", default=DEFAULT_MODEL,
         help=(
             f"model to use (default: {DEFAULT_MODEL}, the free Token Harbor "
-            f"tier; /model paid switches to {PAID_MODEL} at "
-            f"{PAID_BASE_URL})"
+            f"tier). The name picks the tier: a gemma-* name uses the gemma "
+            f"tier ({GEMMA_MODEL} at {GEMMA_BASE_URL}), and "
+            f"{PAID_MODEL} uses the paid DeepSeek tier. /model switches "
+            f"tier at runtime"
         ),
     )
     parser.add_argument(
@@ -5980,7 +6180,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/sessions", "list saved conversations (alias /ls)"),
     ("/skills", "list skill names (alias /skill)"),
     ("/approve [on|off]", "ask before write/edit/delete/execute (alias /auto)"),
-    ("/model [free|paid]", "show the model in use, or switch tier"),
+    ("/model [free|paid|gemma]", "show the model in use, or switch tier"),
     ("/context", "how much context the conversation uses (alias /ctx)"),
     ("/verbose [level]", "quiet, brief or full (alias /verbosity)"),
     ("/reset", "forget the current conversation (alias /clear)"),
@@ -6241,16 +6441,19 @@ def interactive_loop(harness: Harness) -> None:
                     # The same line that sits above the prompt, so the answer
                     # carries the context size too instead of a bare model name.
                     print("\n" + tier_badge(harness))
-                elif argument in {"free", "paid"}:
+                elif argument in TIER_PROFILES:
                     try:
-                        harness.set_free(argument == "free")
+                        harness.set_tier(argument)
                     except ValueError as exc:
                         print(notice("error", f"cannot switch: {exc}",
                                      stream=sys.stderr),
                               file=sys.stderr)
                 else:
                     print(
-                        notice("warn", "usage: /model [free|paid] - blank shows the model",
+                        notice("warn",
+                               "usage: /model "
+                               + "|".join(TIER_ORDER)
+                               + " - blank shows the model",
                                stream=sys.stderr),
                         file=sys.stderr,
                     )
@@ -6378,7 +6581,7 @@ def main() -> int:
 
     rows: list[tuple[str, str]] = [
         ("model", harness.model),
-        ("profile", "free" if harness.free else "paid"),
+        ("profile", harness.tier),
         ("workspace", str(harness.workspace)),
         ("tools", f"{len(harness.tools)} available"),
     ]
